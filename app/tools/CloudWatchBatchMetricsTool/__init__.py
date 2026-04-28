@@ -6,6 +6,7 @@ from typing import Any
 
 from app.services.cloudwatch_client import get_metric_statistics
 from app.tools.tool_decorator import tool
+from app.tools.utils.availability import cloudwatch_is_available
 from app.tools.utils.compaction import truncate_list
 
 
@@ -18,7 +19,10 @@ from app.tools.utils.compaction import truncate_list
         "Understanding batch job performance",
         "Identifying AWS infrastructure issues",
     ],
+    tags=("metrics", "aws"),
+    cost_tier="moderate",
     requires=["job_queue"],
+    is_available=cloudwatch_is_available,
     input_schema={
         "type": "object",
         "properties": {

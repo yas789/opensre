@@ -38,6 +38,7 @@ def _addon_extract_params(sources: dict[str, dict]) -> dict[str, Any]:
             "role_arn": {"type": "string"},
             "external_id": {"type": "string", "default": ""},
             "region": {"type": "string", "default": "us-east-1"},
+            "credentials": {"type": ["object", "null"], "default": None},
         },
         "required": ["cluster_name", "role_arn"],
     },
@@ -50,19 +51,42 @@ def describe_eks_addon(
     role_arn: str,
     external_id: str = "",
     region: str = "us-east-1",
+    credentials: dict[str, Any] | None = None,
     **_kwargs: Any,
 ) -> dict[str, Any]:
     """Describe an EKS addon — coredns, kube-proxy, vpc-cni, aws-ebs-csi-driver, etc."""
     try:
-        client = EKSClient(role_arn=role_arn, external_id=external_id, region=region)
+        client = EKSClient(
+            role_arn=role_arn,
+            external_id=external_id,
+            region=region,
+            credentials=credentials,
+        )
         addon = client.describe_addon(cluster_name, addon_name)
         return {
-            "source": "eks", "available": True, "cluster_name": cluster_name,
-            "addon_name": addon_name, "status": addon.get("status"),
-            "addon_version": addon.get("addonVersion"), "health": addon.get("health", {}),
-            "marketplace_version": addon.get("marketplaceVersion"), "error": None,
+            "source": "eks",
+            "available": True,
+            "cluster_name": cluster_name,
+            "addon_name": addon_name,
+            "status": addon.get("status"),
+            "addon_version": addon.get("addonVersion"),
+            "health": addon.get("health", {}),
+            "marketplace_version": addon.get("marketplaceVersion"),
+            "error": None,
         }
     except ClientError as e:
-        return {"source": "eks", "available": False, "cluster_name": cluster_name, "addon_name": addon_name, "error": str(e)}
+        return {
+            "source": "eks",
+            "available": False,
+            "cluster_name": cluster_name,
+            "addon_name": addon_name,
+            "error": str(e),
+        }
     except Exception as e:
-        return {"source": "eks", "available": False, "cluster_name": cluster_name, "addon_name": addon_name, "error": str(e)}
+        return {
+            "source": "eks",
+            "available": False,
+            "cluster_name": cluster_name,
+            "addon_name": addon_name,
+            "error": str(e),
+        }

@@ -15,8 +15,8 @@ def _list_gitlab_pipelines_extract_params(sources: dict[str, dict]) -> dict[str,
     gl = sources["gitlab"]
     return {
         "project_id": gl["project_id"],
-        "updated_after": gl["updated_after"],
-        "ref": gl.get("ref", "main"),
+        "updated_after": gl.get("updated_after", ""),
+        "ref": gl.get("ref_name", "main"),
         "status": "failed",
         "per_page": 10,
         **_gl_creds(gl),
@@ -68,7 +68,12 @@ def list_gitlab_pipelines(
     """List recent CI/CD pipelines for a GitLab project."""
     config = _resolve_config(gitlab_url, gitlab_token)
     if config is None:
-        return {"source": "gitlab", "available": False, "error": "gitlab integration is not configured.", "pipelines": []}
+        return {
+            "source": "gitlab",
+            "available": False,
+            "error": "gitlab integration is not configured.",
+            "pipelines": [],
+        }
 
     result = get_gitlab_pipelines(
         config=config,

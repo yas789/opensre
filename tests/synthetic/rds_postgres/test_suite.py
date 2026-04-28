@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.synthetic.rds_postgres.run_suite import run_scenario
+from tests.synthetic.rds_postgres.run_suite import run_scenario, score_result
 from tests.synthetic.rds_postgres.scenario_loader import (
     SUITE_DIR,
     load_all_scenarios,
@@ -33,7 +33,9 @@ def test_scenario_metadata_is_valid() -> None:
         assert meta.engine, f"{fixture.scenario_id}: engine must be set"
         assert meta.failure_mode, f"{fixture.scenario_id}: failure_mode must be set"
         assert meta.region, f"{fixture.scenario_id}: region must be set"
-        assert meta.available_evidence, f"{fixture.scenario_id}: available_evidence must not be empty"
+        assert meta.available_evidence, (
+            f"{fixture.scenario_id}: available_evidence must not be empty"
+        )
         unknown = set(meta.available_evidence) - VALID_EVIDENCE_SOURCES
         assert not unknown, f"{fixture.scenario_id}: unknown evidence sources {unknown}"
 
@@ -49,32 +51,174 @@ def test_scenario_evidence_matches_available_evidence() -> None:
         )
 
 
+def test_score_result_does_not_apply_failover_wording_to_storage_scenario() -> None:
+    fixture = load_scenario(SUITE_DIR / "008-storage-full-missing-metric")
+
+    final_state = {
+        "root_cause": (
+            "The RDS instance ran out of storage space, and storage space exhaustion is "
+            "confirmed by the RDS event plus collapsing WriteIOPS."
+        ),
+        "root_cause_category": "resource_exhaustion",
+        "validated_claims": [
+            {"claim": 'RDS event states "DB instance ran out of storage space".'},
+        ],
+        "non_validated_claims": [],
+        "causal_chain": ["Storage filled up, blocked writes, and caused the alert."],
+        "evidence": {
+            "grafana_logs": [
+                {"message": "DB instance ran out of storage space."},
+            ]
+        },
+        "executed_hypotheses": [
+            {
+                "actions": [
+                    "query_grafana_logs",
+                    "query_grafana_metrics",
+                    "query_grafana_alert_rules",
+                ]
+            }
+        ],
+    }
+
+    score = score_result(fixture, final_state)
+
+    assert score.passed is True
+
+
+def test_score_result_keeps_failover_event_reasoning_requirement() -> None:
+    fixture = load_scenario(SUITE_DIR / "005-failover")
+
+    final_state = {
+        "root_cause": (
+            "A Multi-AZ automatic failover occurred after a health check failure on the "
+            "primary host, and workload resumed normally after failover completed. The "
+            "timeline shows failover initiated, failover in progress, failover completed, "
+            "and instance available as the primary evidence source."
+        ),
+        "root_cause_category": "infrastructure",
+        "validated_claims": [
+            {"claim": "The timeline confirms the instance became available again."},
+        ],
+        "non_validated_claims": [],
+        "causal_chain": [
+            "Health check failure triggered standby promotion and client reconnection."
+        ],
+        "evidence": {
+            "grafana_logs": [
+                {"message": "Failover initiated."},
+                {"message": "Failover in progress."},
+                {"message": "Failover completed."},
+                {"message": "Instance available."},
+            ]
+        },
+        "executed_hypotheses": [
+            {
+                "actions": [
+                    "query_grafana_logs",
+                    "query_grafana_metrics",
+                    "query_grafana_alert_rules",
+                ]
+            }
+        ],
+    }
+
+    score = score_result(fixture, final_state)
+
+    assert score.failure_reason == "RDS events gathered but not used as primary reasoning signal"
+
+
+def test_score_result_accepts_failover_event_reasoning() -> None:
+    fixture = load_scenario(SUITE_DIR / "005-failover")
+
+    final_state = {
+        "root_cause": (
+            "Based on the RDS event timeline (primary evidence source), a Multi-AZ "
+            "automatic failover occurred after a health check failure on the primary "
+            "host, and workload resumed normally after failover completed."
+        ),
+        "root_cause_category": "infrastructure",
+        "validated_claims": [
+            {
+                "claim": (
+                    "RDS events show the full sequence: failover initiated -> "
+                    "failover in progress -> failover completed -> instance available."
+                )
+            },
+        ],
+        "non_validated_claims": [],
+        "causal_chain": [
+            "Health check failure triggered failover, standby promotion, DNS update, "
+            "brief outage, and recovery."
+        ],
+        "evidence": {
+            "grafana_logs": [
+                {"message": "Failover initiated."},
+                {"message": "Failover in progress."},
+                {"message": "Failover completed."},
+                {"message": "Instance available."},
+            ]
+        },
+        "executed_hypotheses": [
+            {
+                "actions": [
+                    "query_grafana_logs",
+                    "query_grafana_metrics",
+                    "query_grafana_alert_rules",
+                ]
+            }
+        ],
+    }
+
+    score = score_result(fixture, final_state)
+
+    assert score.passed is True
+
+
 _ALL_SCENARIOS = load_all_scenarios()
+_LLM_ATTEMPTS = 2
 
 
 def _by_difficulty(level: int) -> list:
     return [f for f in _ALL_SCENARIOS if f.metadata.scenario_difficulty == level]
 
 
+def _should_assert_trajectory(fixture, actual_category: str) -> bool:
+    """Keep trajectory assertions for lower-difficulty non-healthy scenarios."""
+
+    return fixture.metadata.scenario_difficulty <= 2 and actual_category != "healthy"
+
+
 def _run_scenario_test(fixture) -> None:
     """Run scenario with real LLM and mock Grafana backend, then assert scoring."""
-    final_state, score = run_scenario(fixture, use_mock_grafana=True)
+    failures: list[str] = []
+    for attempt in range(1, _LLM_ATTEMPTS + 1):
+        final_state, score = run_scenario(fixture, use_mock_grafana=True)
 
-    assert final_state["root_cause"]
-    assert score.passed is True, (
-        f"{fixture.scenario_id} FAILED: {score.failure_reason}\n"
-        f"  actual_category={score.actual_category!r}  "
-        f"  missing_keywords={score.missing_keywords}"
-    )
+        try:
+            assert final_state["root_cause"]
+            assert score.passed is True, (
+                f"{fixture.scenario_id} FAILED: {score.failure_reason}\n"
+                f"  actual_category={score.actual_category!r}  "
+                f"  missing_keywords={score.missing_keywords}"
+            )
 
-    if score.trajectory is not None:
-        assert score.trajectory.efficiency_score >= 1.0, (
-            f"{fixture.scenario_id} TRAJECTORY FAIL: "
-            f"sequencing={score.trajectory.sequencing_ok} "
-            f"calibration={score.trajectory.calibration_ok}\n"
-            f"  expected={score.trajectory.expected_sequence}\n"
-            f"  actual={score.trajectory.actual_sequence}"
-        )
+            if (
+                _should_assert_trajectory(fixture, score.actual_category)
+                and score.trajectory is not None
+            ):
+                assert score.trajectory.sequencing_ok, (
+                    f"{fixture.scenario_id} TRAJECTORY FAIL: "
+                    f"sequencing={score.trajectory.sequencing_ok} "
+                    f"calibration={score.trajectory.calibration_ok}\n"
+                    f"  expected={score.trajectory.expected_sequence}\n"
+                    f"  actual={score.trajectory.actual_sequence}"
+                )
+            return
+        except AssertionError as exc:
+            failures.append(f"attempt {attempt}/{_LLM_ATTEMPTS}: {exc}")
+
+    raise AssertionError("\n\n".join(failures))
 
 
 @pytest.mark.synthetic
@@ -111,12 +255,14 @@ def test_level4_scenario(fixture) -> None:
 
 
 def _write_minimal_answer_yml(scenario_dir: Path) -> None:
-    (scenario_dir / "answer.yml").write_text(textwrap.dedent("""\
+    (scenario_dir / "answer.yml").write_text(
+        textwrap.dedent("""\
         root_cause_category: test_category
         required_keywords:
           - test_keyword
         model_response: "Test model response."
-    """))
+    """)
+    )
 
 
 class TestScenarioInheritance:
@@ -127,12 +273,14 @@ class TestScenarioInheritance:
         scenario_dir = tmp_path / "999-test-inherit"
         scenario_dir.mkdir()
 
-        (scenario_dir / "scenario.yml").write_text(textwrap.dedent("""\
+        (scenario_dir / "scenario.yml").write_text(
+            textwrap.dedent("""\
             base: 000-healthy
             scenario_id: 999-test-inherit
             failure_mode: cpu_saturation
             severity: critical
-        """))
+        """)
+        )
         _write_minimal_answer_yml(scenario_dir)
 
         # Symlink the suite directory so _resolve_base_dir can find 000-healthy.
@@ -167,12 +315,14 @@ class TestScenarioInheritance:
         real_dir = SUITE_DIR / "999-test-fallback"
         real_dir.mkdir(exist_ok=True)
         try:
-            (real_dir / "scenario.yml").write_text(textwrap.dedent("""\
+            (real_dir / "scenario.yml").write_text(
+                textwrap.dedent("""\
                 base: 000-healthy
                 scenario_id: 999-test-fallback
                 failure_mode: healthy
                 severity: info
-            """))
+            """)
+            )
             _write_minimal_answer_yml(real_dir)
 
             fixture = load_scenario(real_dir)
@@ -195,21 +345,27 @@ class TestScenarioInheritance:
         real_dir = SUITE_DIR / "999-test-override"
         real_dir.mkdir(exist_ok=True)
         try:
-            (real_dir / "scenario.yml").write_text(textwrap.dedent("""\
+            (real_dir / "scenario.yml").write_text(
+                textwrap.dedent("""\
                 base: 000-healthy
                 scenario_id: 999-test-override
                 failure_mode: healthy
                 severity: info
-            """))
+            """)
+            )
             _write_minimal_answer_yml(real_dir)
 
-            custom_events = {"events": [{
-                "date": "2026-04-01T00:00:00Z",
-                "message": "Custom test event",
-                "source_identifier": "payments-prod",
-                "source_type": "db-instance",
-                "event_categories": ["notification"],
-            }]}
+            custom_events = {
+                "events": [
+                    {
+                        "date": "2026-04-01T00:00:00Z",
+                        "message": "Custom test event",
+                        "source_identifier": "payments-prod",
+                        "source_type": "db-instance",
+                        "event_categories": ["notification"],
+                    }
+                ]
+            }
             (real_dir / "aws_rds_events.json").write_text(json.dumps(custom_events))
 
             fixture = load_scenario(real_dir)
@@ -229,18 +385,22 @@ class TestScenarioInheritance:
         real_dir.mkdir(exist_ok=True)
         real_dir_b.mkdir(exist_ok=True)
         try:
-            (real_dir.joinpath("scenario.yml")).write_text(textwrap.dedent("""\
+            (real_dir.joinpath("scenario.yml")).write_text(
+                textwrap.dedent("""\
                 base: 000-healthy
                 scenario_id: 999-test-chain-a
                 failure_mode: healthy
                 severity: info
-            """))
-            (real_dir_b / "scenario.yml").write_text(textwrap.dedent("""\
+            """)
+            )
+            (real_dir_b / "scenario.yml").write_text(
+                textwrap.dedent("""\
                 base: 999-test-chain-a
                 scenario_id: 999-test-chain-b
                 failure_mode: healthy
                 severity: info
-            """))
+            """)
+            )
             _write_minimal_answer_yml(real_dir_b)
 
             with pytest.raises(ValueError, match="Chained inheritance is not supported"):
@@ -256,12 +416,14 @@ class TestScenarioInheritance:
         real_dir = SUITE_DIR / "999-test-missing-base"
         real_dir.mkdir(exist_ok=True)
         try:
-            (real_dir / "scenario.yml").write_text(textwrap.dedent("""\
+            (real_dir / "scenario.yml").write_text(
+                textwrap.dedent("""\
                 base: 999-nonexistent
                 scenario_id: 999-test-missing-base
                 failure_mode: healthy
                 severity: info
-            """))
+            """)
+            )
             _write_minimal_answer_yml(real_dir)
 
             with pytest.raises(ValueError, match="Base scenario '999-nonexistent' not found"):

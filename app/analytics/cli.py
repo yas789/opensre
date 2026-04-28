@@ -55,7 +55,9 @@ def _investigation_started_properties(
         "interactive": interactive,
     }
     llm_provider = _string_value(os.getenv("LLM_PROVIDER"))
-    llm_model = _string_value(os.getenv("ANTHROPIC_MODEL")) or _string_value(os.getenv("OPENAI_MODEL"))
+    llm_model = _string_value(os.getenv("ANTHROPIC_MODEL")) or _string_value(
+        os.getenv("OPENAI_MODEL")
+    )
     if llm_provider is not None:
         properties["llm_provider"] = llm_provider
     if llm_model is not None:
@@ -144,18 +146,6 @@ def capture_tests_listed(category: str, *, search: bool) -> None:
 
 def capture_test_run_started(test_id: str, *, dry_run: bool) -> None:
     get_analytics().capture(Event.TEST_RUN_STARTED, {"test_id": test_id, "dry_run": dry_run})
-
-
-def capture_update_started(*, check_only: bool) -> None:
-    get_analytics().capture(Event.UPDATE_STARTED, {"check_only": check_only})
-
-
-def capture_update_completed() -> None:
-    get_analytics().capture(Event.UPDATE_COMPLETED)
-
-
-def capture_update_failed() -> None:
-    get_analytics().capture(Event.UPDATE_FAILED)
 
 
 def capture_deploy_started(*, target: str, dry_run: bool) -> None:

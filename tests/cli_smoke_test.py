@@ -72,6 +72,9 @@ class PtyAction:
     expect: str
     send: bytes
     timeout: float = 10.0
+    #: If > 0, send this many ``j`` keypresses one at a time (prompt_toolkit may
+    #: coalesce a single burst), then send ``send`` (usually ``\\r``).
+    stagger_j: int = 0
 
 
 @dataclass
@@ -111,6 +114,8 @@ class CliSandbox:
 
 
 def _clean_terminal_output(text: str) -> str:
+    if not text:
+        return ""
     cleaned = _ANSI_RE.sub("", text)
     cleaned = cleaned.replace("\r", "\n").replace("\x00", "")
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -153,6 +158,7 @@ def _cli_env(home: Path, project_env_path: Path) -> dict[str, str]:
     env["OPENSRE_NO_TELEMETRY"] = "1"
     env["OPENSRE_PROJECT_ENV_PATH"] = str(project_env_path)
     env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env["TERM"] = "xterm-256color"
     env.pop("OPENSRE_DISABLE_KEYRING", None)
     env["PYTHON_KEYRING_BACKEND"] = "tests.shared.keyring_backend.MemoryKeyring"
@@ -192,6 +198,8 @@ def _run_cli(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         check=False,
     )
@@ -274,6 +282,10 @@ def _run_cli_pty(
     try:
         for action in actions:
             _wait_for_output(process, master_fd, buffer, action.expect, timeout=action.timeout)
+            if action.stagger_j:
+                for _ in range(action.stagger_j):
+                    os.write(master_fd, b"j")
+                    time.sleep(0.05)
             os.write(master_fd, action.send)
 
         deadline = time.monotonic() + timeout
@@ -469,6 +481,7 @@ def test_tests_inventory_commands_smoke(cli_sandbox: CliSandbox) -> None:
 def test_onboard_interactive_smoke(cli_sandbox: CliSandbox) -> None:
     # One `j` per keypress (burst writes are not separate keys). The select list wraps;
     # from the first option, len(choices)-1 steps reach "Skip for now" without wrapping past it.
+    # 19 integrations + "Skip for now" = 20 choices → 19 j's from the top.
     result = _run_cli_pty(
         cli_sandbox,
         "onboard",
@@ -476,7 +489,11 @@ def test_onboard_interactive_smoke(cli_sandbox: CliSandbox) -> None:
             PtyAction(expect="How do you want to get started?", send=b"\r"),
             PtyAction(expect="Choose your LLM provider", send=b"\r"),
             PtyAction(expect="Anthropic API key", send=b"smoke-test-key\r"),
-            PtyAction(expect="Choose an integration to configure", send=b"jjjjjjjjjjjjjjj\r"),
+            PtyAction(
+                expect="Choose an integration to configure",
+                send=b"\r",
+                stagger_j=19,
+            ),
         ],
         timeout=30.0,
     )
@@ -491,6 +508,51 @@ def test_onboard_interactive_smoke(cli_sandbox: CliSandbox) -> None:
     assert "LLM_PROVIDER=anthropic" in cli_sandbox.read_project_env()
     assert "ANTHROPIC_API_KEY=" not in cli_sandbox.read_project_env()
     assert "ANTHROPIC_REASONING_MODEL=" in cli_sandbox.read_project_env()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="interactive smoke uses POSIX PTYs")
+@pytest.mark.skipif(shutil.which("codex") is None, reason="OpenAI Codex CLI not on PATH")
+def test_onboard_interactive_smoke_codex(cli_sandbox: CliSandbox) -> None:
+    """End-to-end PTY: quickstart → Codex CLI path → repick when unauthenticated.
+
+    Selects ``OpenAI Codex CLI`` (five ``j`` presses). With a fresh HOME the CLI
+    is not logged in, so the wizard repicks the default provider (Anthropic) and
+    uses a placeholder API key. Requires ``codex`` on PATH; skips when absent.
+    """
+    result = _run_cli_pty(
+        cli_sandbox,
+        "onboard",
+        actions=[
+            PtyAction(expect="How do you want to get started?", send=b"\r"),
+            PtyAction(expect="Choose your LLM provider", send=b"\r", stagger_j=5),
+            # Fresh HOME in CliSandbox has no Codex auth: repick to Anthropic to finish onboarding.
+            PtyAction(
+                expect="OpenAI Codex CLI requires login. What next?",
+                send=b"\r",
+                stagger_j=1,
+            ),
+            PtyAction(expect="Choose your LLM provider", send=b"\r"),
+            PtyAction(expect="Anthropic API key", send=b"smoke-test-key\r"),
+            PtyAction(
+                expect="Choose an integration to configure",
+                send=b"\r",
+                stagger_j=19,
+            ),
+        ],
+        timeout=60.0,
+    )
+
+    assert result.exit_code == 0
+    assert "Done." in result.stdout
+    assert "summary" in result.stdout
+
+    store = cli_sandbox.read_wizard_store()
+    assert store["targets"]["local"]["provider"] == "anthropic"
+    assert "api_key" not in store["targets"]["local"]
+    env_body = cli_sandbox.read_project_env()
+    assert "LLM_PROVIDER=anthropic\n" in env_body
+    assert "ANTHROPIC_API_KEY=" not in env_body
+    assert "ANTHROPIC_REASONING_MODEL=" in env_body
 
 
 @pytest.mark.skipif(os.name == "nt", reason="interactive smoke uses POSIX PTYs")
@@ -514,7 +576,8 @@ def test_integrations_setup_datadog_interactive_smoke(cli_sandbox: CliSandbox) -
     integrations = cli_sandbox.read_integrations()
     assert len(integrations) == 1
     assert integrations[0]["service"] == "datadog"
-    assert integrations[0]["credentials"]["site"] == "datadoghq.com"
+    # v2 store shape: credentials live inside the default instance.
+    assert integrations[0]["instances"][0]["credentials"]["site"] == "datadoghq.com"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="interactive smoke uses POSIX PTYs")
@@ -557,3 +620,11 @@ def test_tests_interactive_launcher_smoke(cli_sandbox: CliSandbox) -> None:
 
     assert result.exit_code == 0
     assert "Choose a test category:" in result.stdout
+
+
+def test_deploy_help_smoke(cli_sandbox: CliSandbox) -> None:
+    result = _run_cli(cli_sandbox, "deploy", "-h")
+
+    assert result.exit_code == 0
+    assert "ec2" in result.stdout
+    assert "langsmith" in result.stdout

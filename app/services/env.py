@@ -6,7 +6,9 @@ import os
 from typing import Any
 
 
-def _missing_env_error(missing: list[str], *, context: str, hint: str | None = None) -> dict[str, Any]:
+def _missing_env_error(
+    missing: list[str], *, context: str, hint: str | None = None
+) -> dict[str, Any]:
     error = f"Missing required environment variables for {context}: {', '.join(missing)}"
     payload: dict[str, Any] = {
         "success": False,
@@ -17,13 +19,6 @@ def _missing_env_error(missing: list[str], *, context: str, hint: str | None = N
     if hint:
         payload["hint"] = hint
     return payload
-
-
-def require_env(keys: list[str], *, context: str, hint: str | None = None) -> dict[str, Any] | None:
-    missing = [key for key in keys if not os.getenv(key)]
-    if not missing:
-        return None
-    return _missing_env_error(missing, context=context, hint=hint)
 
 
 def make_boto3_client(service: str):

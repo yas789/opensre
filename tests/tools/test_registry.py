@@ -6,15 +6,16 @@ from typing import Any
 
 import pytest
 
-import app.tools.registry as registry_module
+from app.tools import registry as registry_module
 from app.tools.base import BaseTool
 from app.tools.investigation_registry.actions import get_available_actions
 from app.tools.registered_tool import REGISTERED_TOOL_ATTR, RegisteredTool
 from app.tools.tool_decorator import tool
+from app.types.retrieval import RetrievalControls
 
 
 @pytest.fixture(autouse=True)
-def _reset_registry_cache() -> Generator[None, None, None]:
+def _reset_registry_cache() -> Generator[None]:
     registry_module.clear_tool_registry_cache()
     yield
     registry_module.clear_tool_registry_cache()
@@ -142,6 +143,81 @@ def test_function_and_class_tools_share_the_same_runtime_contract() -> None:
     assert function_tool.surfaces == class_tool.surfaces
 
 
+def test_tool_decorator_allows_retrieval_controls_override_for_base_tool() -> None:
+    class LookupIncidentClassTool(BaseTool):
+        name = "lookup_incident_class"
+        description = "Lookup incident metadata."
+        source = "knowledge"
+        surfaces = ("investigation", "chat")
+        retrieval_controls = RetrievalControls(limit=True)
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "incident_id": {
+                    "type": "string",
+                    "description": "Incident identifier",
+                },
+            },
+            "required": ["incident_id"],
+        }
+
+        def run(self, incident_id: str) -> dict[str, str]:
+            return {"incident_id": incident_id}
+
+    class_tool = tool(
+        LookupIncidentClassTool(),
+        retrieval_controls=RetrievalControls(time_bounds=True, filters=True),
+    )
+    registered = getattr(class_tool, REGISTERED_TOOL_ATTR)
+    assert isinstance(registered, RegisteredTool)
+    assert registered.retrieval_controls.time_bounds
+    assert registered.retrieval_controls.filters
+    assert not registered.retrieval_controls.limit
+
+
+def test_tool_decorator_preserves_tags_and_cost_tier_for_base_tool_instances() -> None:
+    class LookupIncidentClassTool(BaseTool):
+        name = "lookup_incident_class"
+        description = "Lookup incident metadata."
+        source = "knowledge"
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "incident_id": {
+                    "type": "string",
+                    "description": "Incident identifier",
+                },
+            },
+            "required": ["incident_id"],
+        }
+
+        def run(self, incident_id: str) -> dict[str, str]:
+            return {"incident_id": incident_id}
+
+    decorated = tool(
+        LookupIncidentClassTool(),
+        tags=("safe", "fast"),
+        cost_tier="cheap",
+    )
+
+    registered = getattr(decorated, REGISTERED_TOOL_ATTR)
+    assert isinstance(registered, RegisteredTool)
+    assert registered.tags == ("safe", "fast")
+    assert registered.cost_tier == "cheap"
+
+
+def test_registered_tool_rejects_unknown_cost_tier() -> None:
+    def lookup_incident(incident_id: str) -> dict[str, str]:
+        return {"incident_id": incident_id}
+
+    with pytest.raises(ValueError, match="Unsupported cost tier"):
+        RegisteredTool.from_function(
+            lookup_incident,
+            source="knowledge",
+            cost_tier="free",  # type: ignore[arg-type]
+        )
+
+
 def test_auto_discovery_populates_investigation_and_chat_surfaces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -159,18 +235,20 @@ def test_auto_discovery_populates_investigation_and_chat_surfaces(
     get_incident_metadata.__module__ = module.__name__
     module.get_incident_metadata = get_incident_metadata
 
-    monkeypatch.setattr(registry_module, "_iter_tool_module_names", lambda: ["fake_discovered_tool"])
+    monkeypatch.setattr(
+        registry_module, "_iter_tool_module_names", lambda: ["fake_discovered_tool"]
+    )
     monkeypatch.setattr(registry_module, "_import_tool_module", lambda _name: module)
 
-    assert [tool_def.name for tool_def in registry_module.get_registered_tools("investigation")] == [
-        "get_incident_metadata"
-    ]
+    assert [
+        tool_def.name for tool_def in registry_module.get_registered_tools("investigation")
+    ] == ["get_incident_metadata"]
     assert [tool_def.name for tool_def in registry_module.get_registered_tools("chat")] == [
         "get_incident_metadata"
     ]
-    assert registry_module.get_registered_tool_map("chat")["get_incident_metadata"].run("inc-1") == {
-        "incident_id": "inc-1"
-    }
+    assert registry_module.get_registered_tool_map("chat")["get_incident_metadata"].run(
+        "inc-1"
+    ) == {"incident_id": "inc-1"}
 
 
 def test_real_registry_discovers_migrated_sre_guidance_tool() -> None:

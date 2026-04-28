@@ -1,24 +1,25 @@
 # Contributing
 
-Thanks for your interest in contributing to Tracer.
-
-This document describes how to set up your environment, propose changes, report bugs, and submit pull requests in a way that keeps review fast and the project reliable.
+Welcome to OpenSRE
 
 ## Quick Links
 
-- **Docs:** https://tracer.mintlify.app
-- **Support / Contact:** hello@tracer.cloud
-- **Security Issues:** See `SECURITY.md` (do not open public issues)
+- **GitHub:** https://github.com/Tracer-Cloud/opensre
+- **Vision:** [`VISION.md`](VISION.md)
+- **Discord:** https://discord.gg/opensre
+- **X/Twitter:** §[@open_sre](https://x.com/open_sre)
 
-## Before You Start
+## How to Contribute
 
-### How to Contribute
+Use the path that matches the kind of contribution you want to make:
 
-- **Bugs & small fixes:** Open a GitHub Issue using the [bug report template](.github/ISSUE_TEMPLATE/bug_report.md) and/or submit a PR
-- **New features / behavioral changes:** Open a GitHub Issue using the [feature request template](.github/ISSUE_TEMPLATE/feature_request.md) first to discuss the approach
-- **Improvements / refactoring:** Open a GitHub Issue using the [improvement template](.github/ISSUE_TEMPLATE/improvement.md)
-- **Questions / “how do I”:** Use the docs or email hello@tracer.cloud (Issues are for actionable work)
-- **Security issues:** Follow `SECURITY.md` — do not open a public issue
+1. **Bugs & small fixes** -> Open a PR. If you need to file an issue first, use the [bug report template](https://github.com/Tracer-Cloud/opensre/issues/new?template=bug_report.yml).
+2. **New features or behavioral changes** -> Start with a [feature request](https://github.com/Tracer-Cloud/opensre/issues/new?template=feature_request.yml) or ask in Discord before coding. Most feature ideas are better shipped as third-party plugins via the plugin SDK.
+3. **Improvements tied to concrete work** -> Use the [improvement template](https://github.com/Tracer-Cloud/opensre/issues/new?template=improvement.yml) when proposing a focused refactor, optimization, or quality improvement.
+4. **Refactor-only PRs** -> Do not open one unless a maintainer explicitly asked for it as part of a real fix.
+5. **Test/CI-only PRs for known `main` failures** -> Do not open one unless the change is required to validate a real fix the maintainers asked for.
+6. **Questions** -> Use the docs, email hello@tracer.cloud, or ask in Discord [#contribute](http://discord.gg/opensre). GitHub Issues are for actionable work.
+7. **Security issues** -> Follow `SECURITY.md`; do not open a public issue.
 
 ### Environment Setup
 
@@ -28,22 +29,25 @@ See **[SETUP.md](SETUP.md)** for detailed setup instructions including Windows-s
 
 1. Clone the repo and create a virtual environment
 2. Install dependencies: `pip install -e ".[dev]"`
-3. Run checks: `make lint && make typecheck && make test-cov`
+3. Run checks: `make lint && make format-check && make typecheck && make test-cov`
 4. Build release artifacts when needed: `make build`
+
+If you prefer VS Code, you can use the repo's devcontainer at [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) instead of setting up Python manually.
 
 ---
 
-**The basic flow:**
+**Contribution flow:**
 
-1. **Find or create an issue** — Bug? Feature? Improvement? Create or comment on an issue first
-2. **Discuss (if needed)** — For features/changes, discuss approach in the issue before coding
-3. **Fork and branch** — Create a branch for your work: `git checkout -b issue/123-description`
-4. **Code and test** — Make changes, add tests, ensure all checks pass
-5. **Submit a PR** — Open a pull request linked to the issue; use the PR template
-6. **Review & iterate** — Respond to feedback, make changes as needed
-7. **Merge** — Maintainer merges once approved
+1. **Find or create an issue** — Pick an existing one (Path A) or raise a new one (Path B)
+2. **Request assignment** — Comment on the issue so maintainers know you're working on it
+3. **Discuss (if needed)** — For features/changes, discuss approach in the issue before coding
+4. **Fork and branch** — Create a branch for your work: `git checkout -b issue/123-description`
+5. **Code and test** — Make changes, add tests, ensure all checks pass
+6. **Submit a PR** — Open a pull request (or draft PR) linked to the issue; use the PR template
+7. **Review & iterate** — Respond to feedback, make changes as needed
+8. **Merge** — Maintainer merges once approved
 
-**Detailed steps:** See “Development Workflow” section below.
+**Detailed steps:** See the "Development Workflow" section below.
 
 ---
 
@@ -91,6 +95,8 @@ Notes:
 
 ### 3. Add or Update Tests
 
+- **Test Location:** New tests should be placed in the `tests/` directory, mirroring the structure of the `app/` directory (e.g., tests for `app/cli/` go in `tests/cli/`).
+- **No Inline Tests:** Avoid adding `*_test.py` files directly inside the `app/` directory. We are phasing out existing inline tests to keep the core logic clean.
 - Bug fixes should include a test that would have caught the bug
 - New features should have corresponding tests
 - Aim for >80% code coverage (run `make test-cov` to check)
@@ -98,12 +104,13 @@ Notes:
 ### 4. Run Local Checks (Required Before PR)
 
 ```bash
-make lint        # ruff: check code style
-make typecheck   # mypy: check type annotations
-make test-cov    # pytest: run tests with coverage report
+make lint          # ruff: check code style
+make format-check  # ruff: check formatting (read-only)
+make typecheck     # mypy: check type annotations
+make test-cov      # pytest: run tests with coverage report
 ```
 
-All three must pass. **CI will block merging if any fail.**
+All four must pass. **CI will block merging if any fail.**
 
 ### 5. Open a Pull Request
 
@@ -124,7 +131,7 @@ Use the **[PR template](.github/PULL_REQUEST_TEMPLATE.md)** (automatically provi
 ### PR Checklist Before Submitting
 
 - [ ] Linked to the relevant issue
-- [ ] All local checks pass: `make lint && make typecheck && make test-cov`
+- [ ] All local checks pass: `make lint && make format-check && make typecheck && make test-cov`
 - [ ] Added tests for bug fixes or new features
 - [ ] Updated documentation if behavior changed
 - [ ] Code follows project style (see **Code Quality** section below)
@@ -172,9 +179,10 @@ We use:
 Run these before every commit:
 
 ```bash
-make lint        # Auto-fixes many style issues
-make typecheck   # Catches type errors
-make test-cov    # Ensures tests pass and coverage is tracked
+make lint          # Auto-fixes many style issues
+make format-check  # Checks formatting without modifying files
+make typecheck     # Catches type errors
+make test-cov      # Ensures tests pass and coverage is tracked
 ```
 
 To verify the package can be shipped, run:
@@ -185,7 +193,7 @@ make build
 
 ## Reporting Bugs
 
-Use the **[bug report template](.github/ISSUE_TEMPLATE/bug_report.md)** when creating an issue. It guides you to include:
+Use the **[bug report template](https://github.com/Tracer-Cloud/opensre/issues/new?template=bug_report.yml)** when creating an issue. It guides you to include:
 
 - **Summary:** One-line description of the bug (specific, not vague)
 - **Expected behavior:** What should happen
@@ -219,7 +227,7 @@ Error: exit code 0
 
 ## Requesting Features
 
-Use the **[feature request template](.github/ISSUE_TEMPLATE/feature_request.md)** to propose new functionality. It guides you to clarify:
+Use the **[feature request template](https://github.com/Tracer-Cloud/opensre/issues/new?template=feature_request.yml)** to propose new functionality. It guides you to clarify:
 
 - **Problem statement:** Why do we need this? (focus on the problem, not solution)
 - **Proposed solution:** How should it work? (specific and concrete with examples)
@@ -230,7 +238,7 @@ Use the **[feature request template](.github/ISSUE_TEMPLATE/feature_request.md)*
 
 ## Suggesting Improvements
 
-Use the **[improvement template](.github/ISSUE_TEMPLATE/improvement.md)** to propose refactors, optimizations, or quality improvements. It requires:
+Use the **[improvement template](https://github.com/Tracer-Cloud/opensre/issues/new?template=improvement.yml)** to propose refactors, optimizations, or quality improvements. It requires:
 
 - **Current state:** How does it work now? (with code references)
 - **Desired state:** How should it work instead?
@@ -248,4 +256,4 @@ Use the **[improvement template](.github/ISSUE_TEMPLATE/improvement.md)** to pro
 
 ## Licensing
 
-By contributing, you agree that your contributions will be licensed under the project’s license (see `LICENSE`).
+By contributing, you agree that your contributions will be licensed under the project's license (see `LICENSE`).

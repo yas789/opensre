@@ -22,6 +22,7 @@ _HELP_COMMANDS: tuple[tuple[str, str], ...] = (
     ("remote", "Connect to remote agents and hosted service ops."),
     ("tests", "Browse and run inventoried tests from the terminal."),
     ("integrations", "Manage local integration credentials."),
+    ("guardrails", "Manage sensitive information guardrail rules."),
     ("health", "Check integration and agent setup status."),
     ("doctor", "Run a full environment diagnostic."),
     ("update", "Check for a newer version and update if one is available."),
@@ -36,6 +37,7 @@ _LANDING_COMMANDS: tuple[tuple[str, str], ...] = (
     ("opensre remote ops status", "Inspect hosted service status (Railway)"),
     ("opensre tests", "Browse and run inventoried tests"),
     ("opensre integrations list", "Show configured integrations"),
+    ("opensre guardrails rules", "List configured guardrail rules"),
     ("opensre health", "Check integration and agent setup status"),
     ("opensre doctor", "Run a full environment diagnostic"),
     ("opensre update", "Update to the latest version"),
@@ -107,5 +109,5 @@ def render_landing() -> None:
 class RichGroup(click.Group):
     """Click group with a custom Rich-powered help screen."""
 
-    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:  # noqa: ARG002
+    def format_help(self, _ctx: click.Context, _formatter: click.HelpFormatter) -> None:
         render_help()

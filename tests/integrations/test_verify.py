@@ -12,6 +12,7 @@ from app.integrations.verify import (
     _verify_grafana,
     _verify_honeycomb,
     _verify_sentry,
+    _verify_snowflake,
     _verify_tracer,
     _verify_vercel,
     resolve_effective_integrations,
@@ -31,9 +32,11 @@ class _FakeResponse:
         return self._payload
 
 
-def test_resolve_effective_integrations_prefers_local_store(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_effective_integrations_prefers_local_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
-        "app.integrations.verify.load_integrations",
+        "app.integrations.catalog.load_integrations",
         lambda: [
             {
                 "id": "grafana-local",
@@ -62,7 +65,7 @@ def test_resolve_effective_integrations_prefers_local_store(monkeypatch: pytest.
 def test_resolve_effective_integrations_includes_honeycomb_and_coralogix_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("app.integrations.verify.load_integrations", lambda: [])
+    monkeypatch.setattr("app.integrations.catalog.load_integrations", lambda: [])
     monkeypatch.setenv("HONEYCOMB_API_KEY", "hny_test")
     monkeypatch.setenv("HONEYCOMB_DATASET", "prod-api")
     monkeypatch.setenv("CORALOGIX_API_KEY", "cx_test")
@@ -75,11 +78,25 @@ def test_resolve_effective_integrations_includes_honeycomb_and_coralogix_env(
     assert effective["coralogix"]["config"]["application_name"] == "payments"
 
 
+def test_resolve_effective_integrations_skips_snowflake_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.integrations.catalog.load_integrations", lambda: [])
+    monkeypatch.setenv("SNOWFLAKE_ACCOUNT_IDENTIFIER", "env-account")
+    monkeypatch.delenv("SNOWFLAKE_TOKEN", raising=False)
+    monkeypatch.setenv("SNOWFLAKE_USER", "service-user")
+    monkeypatch.setenv("SNOWFLAKE_PASSWORD", "secret")
+
+    effective = resolve_effective_integrations()
+
+    assert "snowflake" not in effective
+
+
 def test_resolve_effective_integrations_keeps_incomplete_datadog_store_record(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "app.integrations.verify.load_integrations",
+        "app.integrations.catalog.load_integrations",
         lambda: [
             {
                 "id": "datadog-local",
@@ -156,6 +173,21 @@ def test_verify_datadog_accepts_integration_id() -> None:
 
     assert result["status"] == "missing"
     assert "Missing API key" in result["detail"]
+
+
+def test_verify_snowflake_requires_token() -> None:
+    result = _verify_snowflake(
+        "local env",
+        {
+            "account_identifier": "xy12345.us-east-1",
+            "user": "service-user",
+            "password": "secret",
+            "token": "",
+        },
+    )
+
+    assert result["status"] == "missing"
+    assert result["detail"] == "Missing token credentials."
 
 
 def test_verify_honeycomb_uses_auth_and_query(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -270,7 +302,11 @@ def test_verify_github_uses_shared_validator(monkeypatch: pytest.MonkeyPatch) ->
 
     result = _verify_github(
         "local env",
-        {"url": "https://api.githubcopilot.com/mcp/", "mode": "streamable-http", "auth_token": "ghp"},
+        {
+            "url": "https://api.githubcopilot.com/mcp/",
+            "mode": "streamable-http",
+            "auth_token": "ghp",
+        },
     )
 
     assert result["status"] == "passed"
@@ -298,62 +334,74 @@ def test_verify_sentry_uses_shared_validator(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_verification_exit_code_requires_core_success() -> None:
-    assert verification_exit_code(
-        [
-            {
-                "service": "slack",
-                "source": "local env",
-                "status": "configured",
-                "detail": "Incoming webhook configured.",
-            }
-        ]
-    ) == 1
+    assert (
+        verification_exit_code(
+            [
+                {
+                    "service": "slack",
+                    "source": "local env",
+                    "status": "configured",
+                    "detail": "Incoming webhook configured.",
+                }
+            ]
+        )
+        == 1
+    )
 
-    assert verification_exit_code(
-        [
-            {
-                "service": "grafana",
-                "source": "local env",
-                "status": "passed",
-                "detail": "Connected.",
-            },
-            {
-                "service": "slack",
-                "source": "local env",
-                "status": "configured",
-                "detail": "Incoming webhook configured.",
-            },
-        ]
-    ) == 0
+    assert (
+        verification_exit_code(
+            [
+                {
+                    "service": "grafana",
+                    "source": "local env",
+                    "status": "passed",
+                    "detail": "Connected.",
+                },
+                {
+                    "service": "slack",
+                    "source": "local env",
+                    "status": "configured",
+                    "detail": "Incoming webhook configured.",
+                },
+            ]
+        )
+        == 0
+    )
 
-    assert verification_exit_code(
-        [
-            {
-                "service": "grafana",
-                "source": "local env",
-                "status": "passed",
-                "detail": "Connected.",
-            },
-            {
-                "service": "slack",
-                "source": "local env",
-                "status": "failed",
-                "detail": "Webhook post failed.",
-            },
-        ]
-    ) == 1
+    assert (
+        verification_exit_code(
+            [
+                {
+                    "service": "grafana",
+                    "source": "local env",
+                    "status": "passed",
+                    "detail": "Connected.",
+                },
+                {
+                    "service": "slack",
+                    "source": "local env",
+                    "status": "failed",
+                    "detail": "Webhook post failed.",
+                },
+            ]
+        )
+        == 1
+    )
 
-    assert verification_exit_code(
-        [
-            {
-                "service": "slack",
-                "source": "local env",
-                "status": "configured",
-                "detail": "Incoming webhook configured.",
-            }
-        ],
-        requested_service="slack",
-    ) == 0
+    assert (
+        verification_exit_code(
+            [
+                {
+                    "service": "slack",
+                    "source": "local env",
+                    "status": "configured",
+                    "detail": "Incoming webhook configured.",
+                }
+            ],
+            requested_service="slack",
+        )
+        == 0
+    )
 
 
 def test_verify_vercel_passes_with_valid_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -421,7 +469,7 @@ def test_verify_integrations_dispatches_to_vercel(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr("app.integrations.verify.VercelClient", _FakeVercelClient)
     monkeypatch.setattr(
-        "app.integrations.verify.load_integrations",
+        "app.integrations.catalog.load_integrations",
         lambda: [
             {
                 "id": "vercel-1",
@@ -439,9 +487,11 @@ def test_verify_integrations_dispatches_to_vercel(monkeypatch: pytest.MonkeyPatc
     assert results[0]["status"] == "passed"
 
 
-def test_resolve_effective_integrations_includes_vercel_from_store(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_effective_integrations_includes_vercel_from_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
-        "app.integrations.verify.load_integrations",
+        "app.integrations.catalog.load_integrations",
         lambda: [
             {
                 "id": "vercel-store-1",
@@ -461,8 +511,10 @@ def test_resolve_effective_integrations_includes_vercel_from_store(monkeypatch: 
     assert vercel["source"] == "local store"
 
 
-def test_resolve_effective_integrations_includes_vercel_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("app.integrations.verify.load_integrations", lambda: [])
+def test_resolve_effective_integrations_includes_vercel_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.integrations.catalog.load_integrations", lambda: [])
     monkeypatch.setenv("VERCEL_API_TOKEN", "tok_env")
     monkeypatch.setenv("VERCEL_TEAM_ID", "team_env")
 

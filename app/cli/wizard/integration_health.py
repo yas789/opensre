@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import requests
+import httpx
 
-from app.integrations.github_mcp import build_github_mcp_config, validate_github_mcp_config
+from app.integrations.betterstack import build_betterstack_config, validate_betterstack_config
+from app.integrations.github_mcp import (
+    GitHubMCPValidationResult,
+    build_github_mcp_config,
+    format_github_mcp_validation_cli_report,
+    validate_github_mcp_config,
+)
 from app.integrations.gitlab import build_gitlab_config, validate_gitlab_config
 from app.integrations.models import (
     AWSIntegrationConfig,
@@ -16,7 +22,9 @@ from app.integrations.models import (
     HoneycombIntegrationConfig,
     SlackWebhookConfig,
 )
+from app.integrations.openclaw import build_openclaw_config, validate_openclaw_config
 from app.integrations.sentry import build_sentry_config, validate_sentry_config
+from app.services.alertmanager import make_alertmanager_client
 from app.services.coralogix import CoralogixClient
 from app.services.datadog import DatadogClient, DatadogConfig
 from app.services.grafana import get_grafana_client_from_credentials
@@ -31,6 +39,7 @@ class IntegrationHealthResult:
 
     ok: bool
     detail: str
+    github_mcp: GitHubMCPValidationResult | None = None
 
 
 def validate_grafana_integration(*, endpoint: str, api_key: str) -> IntegrationHealthResult:
@@ -173,8 +182,12 @@ def validate_slack_webhook(*, webhook_url: str) -> IntegrationHealthResult:
         return IntegrationHealthResult(ok=False, detail=str(err))
 
     try:
-        response = requests.get(slack_config.webhook_url, timeout=10, allow_redirects=False)
-    except requests.RequestException as err:
+        response = httpx.get(
+            slack_config.webhook_url,
+            timeout=10,
+            follow_redirects=False,
+        )
+    except httpx.RequestError as err:
         return IntegrationHealthResult(ok=False, detail=f"Slack webhook validation failed: {err}")
 
     if response.status_code == 404:
@@ -279,6 +292,8 @@ def validate_github_mcp_integration(
     command: str = "",
     args: list[str] | None = None,
     toolsets: list[str] | None = None,
+    repo_view: str = "auto",
+    repo_visibility: str = "any",
 ) -> IntegrationHealthResult:
     """Validate GitHub MCP connectivity and required repository tools."""
     config = build_github_mcp_config(
@@ -291,8 +306,41 @@ def validate_github_mcp_integration(
             "toolsets": toolsets or [],
         }
     )
-    result = validate_github_mcp_config(config)
-    return IntegrationHealthResult(ok=result.ok, detail=result.detail)
+    result = validate_github_mcp_config(
+        config,
+        repo_view=repo_view,  # type: ignore[arg-type]
+        repo_visibility=repo_visibility,  # type: ignore[arg-type]
+    )
+    return IntegrationHealthResult(
+        ok=result.ok,
+        detail=format_github_mcp_validation_cli_report(result),
+        github_mcp=result,
+    )
+
+
+def validate_openclaw_integration(
+    *,
+    url: str = "",
+    mode: str,
+    auth_token: str = "",
+    command: str = "",
+    args: list[str] | None = None,
+) -> IntegrationHealthResult:
+    """Validate OpenClaw MCP connectivity by listing available tools."""
+    try:
+        config = build_openclaw_config(
+            {
+                "url": url,
+                "mode": mode,
+                "auth_token": auth_token,
+                "command": command,
+                "args": args or [],
+            }
+        )
+        result = validate_openclaw_config(config)
+        return IntegrationHealthResult(ok=result.ok, detail=result.detail)
+    except Exception as err:
+        return IntegrationHealthResult(ok=False, detail=f"OpenClaw validation failed: {err}")
 
 
 def validate_sentry_integration(
@@ -314,9 +362,11 @@ def validate_sentry_integration(
     result = validate_sentry_config(config)
     return IntegrationHealthResult(ok=result.ok, detail=result.detail)
 
+
 def validate_notion_integration(*, api_key: str, database_id: str) -> IntegrationHealthResult:
     """Validate Notion connectivity by querying the target database."""
     import httpx
+
     try:
         resp = httpx.get(
             f"https://api.notion.com/v1/databases/{database_id}",
@@ -327,14 +377,22 @@ def validate_notion_integration(*, api_key: str, database_id: str) -> Integratio
             timeout=10,
         )
         if resp.status_code == 200:
-            return IntegrationHealthResult(ok=True, detail="Notion database reachable and token valid.")
+            return IntegrationHealthResult(
+                ok=True, detail="Notion database reachable and token valid."
+            )
         if resp.status_code == 401:
             return IntegrationHealthResult(ok=False, detail="Notion API key is invalid or expired.")
         if resp.status_code == 404:
-            return IntegrationHealthResult(ok=False, detail="Notion database not found. Check the database ID and sharing settings.")
-        return IntegrationHealthResult(ok=False, detail=f"Notion returned unexpected status {resp.status_code}.")
+            return IntegrationHealthResult(
+                ok=False,
+                detail="Notion database not found. Check the database ID and sharing settings.",
+            )
+        return IntegrationHealthResult(
+            ok=False, detail=f"Notion returned unexpected status {resp.status_code}."
+        )
     except Exception as e:
         return IntegrationHealthResult(ok=False, detail=f"Notion validation failed: {e}")
+
 
 def validate_gitlab_integration(
     *,
@@ -342,14 +400,10 @@ def validate_gitlab_integration(
     auth_token: str,
 ) -> IntegrationHealthResult:
     """Validate Gitlab connectivity with an users api."""
-    config = build_gitlab_config(
-        {
-            "base_url": base_url,
-            "auth_token": auth_token
-        }
-    )
+    config = build_gitlab_config({"base_url": base_url, "auth_token": auth_token})
     result = validate_gitlab_config(config)
     return IntegrationHealthResult(ok=result.ok, detail=result.detail)
+
 
 def validate_google_docs_integration(
     *,
@@ -396,6 +450,29 @@ def validate_google_docs_integration(
     )
 
 
+def validate_betterstack_integration(
+    *,
+    query_endpoint: str,
+    username: str,
+    password: str,
+    sources: list[str] | None = None,
+) -> IntegrationHealthResult:
+    """Validate Better Stack Telemetry credentials via a ``SELECT 1`` probe."""
+    try:
+        config = build_betterstack_config(
+            {
+                "query_endpoint": query_endpoint,
+                "username": username,
+                "password": password,
+                "sources": list(sources or []),
+            }
+        )
+    except Exception as err:  # noqa: BLE001 — config errors should surface to the user verbatim
+        return IntegrationHealthResult(ok=False, detail=f"Better Stack config invalid: {err}")
+    result = validate_betterstack_config(config)
+    return IntegrationHealthResult(ok=result.ok, detail=result.detail)
+
+
 def validate_vercel_integration(*, api_token: str, team_id: str = "") -> IntegrationHealthResult:
     """Validate Vercel credentials by listing accessible projects."""
     if not api_token:
@@ -416,7 +493,9 @@ def validate_vercel_integration(*, api_token: str, team_id: str = "") -> Integra
         return IntegrationHealthResult(ok=False, detail=f"Vercel validation failed: {err}")
 
 
-def validate_jira_integration(*, base_url: str, email: str, api_token: str, project_key: str) -> IntegrationHealthResult:
+def validate_jira_integration(
+    *, base_url: str, email: str, api_token: str, project_key: str
+) -> IntegrationHealthResult:
     """Validate Jira connectivity and project key accessibility."""
     import httpx
 
@@ -438,18 +517,72 @@ def validate_jira_integration(*, base_url: str, email: str, api_token: str, proj
                 timeout=10,
             )
             if project_resp.status_code == 404:
-                return IntegrationHealthResult(ok=False, detail=f"Project '{project_key}' not found. Check the project key.")
+                return IntegrationHealthResult(
+                    ok=False, detail=f"Project '{project_key}' not found. Check the project key."
+                )
             if project_resp.status_code != 200:
-                return IntegrationHealthResult(ok=False, detail=f"Could not verify project '{project_key}': HTTP {project_resp.status_code}.")
+                return IntegrationHealthResult(
+                    ok=False,
+                    detail=f"Could not verify project '{project_key}': HTTP {project_resp.status_code}.",
+                )
 
-            return IntegrationHealthResult(ok=True, detail=f"Jira connected as {display}, project '{project_key}' verified.")
+            return IntegrationHealthResult(
+                ok=True, detail=f"Jira connected as {display}, project '{project_key}' verified."
+            )
         if resp.status_code == 401:
-            return IntegrationHealthResult(ok=False, detail="Jira credentials invalid. Check email and API token.")
+            return IntegrationHealthResult(
+                ok=False, detail="Jira credentials invalid. Check email and API token."
+            )
         if resp.status_code == 404:
-            return IntegrationHealthResult(ok=False, detail="Jira base URL not found. Check the URL.")
-        return IntegrationHealthResult(ok=False, detail=f"Jira returned unexpected status {resp.status_code}.")
+            return IntegrationHealthResult(
+                ok=False, detail="Jira base URL not found. Check the URL."
+            )
+        return IntegrationHealthResult(
+            ok=False, detail=f"Jira returned unexpected status {resp.status_code}."
+        )
     except Exception as e:
         return IntegrationHealthResult(ok=False, detail=f"Jira validation failed: {e}")
+
+
+def validate_alertmanager_integration(
+    *,
+    base_url: str,
+    bearer_token: str = "",
+    username: str = "",
+    password: str = "",
+) -> IntegrationHealthResult:
+    """Validate Alertmanager connectivity via the /api/v2/status endpoint."""
+    if not base_url:
+        return IntegrationHealthResult(ok=False, detail="Alertmanager URL is required.")
+    client = make_alertmanager_client(
+        base_url=base_url,
+        bearer_token=bearer_token or None,
+        username=username or None,
+        password=password or None,
+    )
+    if client is None:
+        return IntegrationHealthResult(ok=False, detail="Invalid Alertmanager URL.")
+    try:
+        result = client.get_status()
+        if result.get("success"):
+            status_data = result.get("status", {})
+            cluster_status = (
+                status_data.get("cluster", {}).get("status", "unknown")
+                if isinstance(status_data, dict)
+                else "ok"
+            )
+            return IntegrationHealthResult(
+                ok=True,
+                detail=f"Connected to Alertmanager at {base_url}; cluster status: {cluster_status}.",
+            )
+        return IntegrationHealthResult(
+            ok=False,
+            detail=f"Alertmanager validation failed: {result.get('error', 'unknown error')}",
+        )
+    except Exception as err:
+        return IntegrationHealthResult(ok=False, detail=f"Alertmanager validation failed: {err}")
+    finally:
+        client.close()
 
 
 def validate_opsgenie_integration(
@@ -478,3 +611,26 @@ def validate_opsgenie_integration(
             ok=False,
             detail=f"OpsGenie validation failed: {err}",
         )
+
+
+def validate_discord_bot(*, bot_token: str) -> IntegrationHealthResult:
+    """Validate a Discord bot token by calling the /users/@me endpoint."""
+    import httpx
+
+    try:
+        resp = httpx.get(
+            "https://discord.com/api/v10/users/@me",
+            headers={"Authorization": f"Bot {bot_token}"},
+            timeout=10,
+        )
+    except httpx.RequestError as err:
+        return IntegrationHealthResult(ok=False, detail=f"Discord API unreachable: {err}")
+
+    if resp.status_code == 200:
+        username = resp.json().get("username", "unknown")
+        return IntegrationHealthResult(ok=True, detail=f"Discord bot authenticated as @{username}.")
+    if resp.status_code == 401:
+        return IntegrationHealthResult(ok=False, detail="Discord bot token is invalid or revoked.")
+    return IntegrationHealthResult(
+        ok=False, detail=f"Discord API returned unexpected HTTP {resp.status_code}."
+    )

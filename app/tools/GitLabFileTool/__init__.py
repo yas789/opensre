@@ -10,6 +10,7 @@ from app.integrations.gitlab import (
 )
 from app.tools.GitLabCommitsTool import _gitlab_available, _gl_creds, _resolve_config
 from app.tools.tool_decorator import tool
+from app.tools.utils.code_host_unavailable import code_host_unavailable_payload
 
 
 def _get_gitlab_file_extract_params(sources: dict[str, dict]) -> dict[str, Any]:
@@ -17,7 +18,7 @@ def _get_gitlab_file_extract_params(sources: dict[str, dict]) -> dict[str, Any]:
     return {
         "project_id": gl["project_id"],
         "file_path": gl.get("file_path", ""),
-        "ref": gl.get("ref", "main"),
+        "ref": gl.get("ref_name", "main"),
         **_gl_creds(gl),
     }
 
@@ -63,7 +64,12 @@ def get_gitlab_file_contents(
     """Read the contents of a specific file from a GitLab repository."""
     config = _resolve_config(gitlab_url, gitlab_token)
     if config is None:
-        return {"source": "gitlab", "available": False, "error": "gitlab integration is not configured.", "file": {}}
+        return code_host_unavailable_payload(
+            source="gitlab",
+            integration_name="gitlab",
+            empty_key="file",
+            empty_value={},
+        )
 
     result = get_gitlab_file(
         config=config,
@@ -72,7 +78,12 @@ def get_gitlab_file_contents(
         file_path=file_path,
     )
     if result.get("size", 0) > 50_000:
-        return {"source": "gitlab", "available": False, "error": f"File too large to read ({result['size']} bytes)", "file": {}}
+        return {
+            "source": "gitlab",
+            "available": False,
+            "error": f"File too large to read ({result['size']} bytes)",
+            "file": {},
+        }
 
     content_raw = result.get("content", "")
     if content_raw:

@@ -1,16 +1,29 @@
 """Data source detection for dynamic investigation.
 
-Scans alert annotations and state context to detect available data sources
-(CloudWatch, S3, local files, Tracer Web, Grafana, Honeycomb, Coralogix)
+    Scans alert annotations and state context to detect available data sources
+    (CloudWatch, S3, local files, Tracer Web, Grafana, Honeycomb, Coralogix, OpenClaw)
 and extract their parameters.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
+from app.integrations.azure_sql import DEFAULT_AZURE_SQL_PORT
+from app.integrations.opensre.csv_grafana_backend import OpenSRECsvGrafanaBackend
+from app.integrations.opensre.inject import inject_opensre_into_resolved_integrations
 from app.services.coralogix import build_coralogix_logs_query
 from app.tools.GrafanaLogsTool import _map_pipeline_to_service_name
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _alert_time_range_minutes(raw_alert: dict[str, Any]) -> int:
@@ -72,7 +85,7 @@ def _alert_since_iso(raw_alert: dict[str, Any]) -> str:
             if alert_time.year >= 2000:
                 return (alert_time - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         except (ValueError, TypeError):
-            pass  # Invalid or malformed timestamp string — fall through to the default below
+            return (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -108,6 +121,37 @@ def _parse_gitlab_repo_url(value: str) -> str:
         return ""
     # Handle subgroups: return everything after the host as namespace/repo
     return "/".join(parts).removesuffix(".git")
+
+
+def _parse_bitbucket_repo_url(value: str) -> tuple[str, str]:
+    parsed = urlparse(value.strip())
+    host = (parsed.hostname or "").lower().strip()
+    if not host:
+        return "", ""
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        return "", ""
+
+    # Bitbucket Cloud style: /{workspace}/{repo_slug}/...
+    if host == "bitbucket.org" or host.endswith(".bitbucket.org"):
+        workspace = parts[0].strip()
+        repo_slug = parts[1].strip().removesuffix(".git")
+        return workspace, repo_slug
+
+    # Bitbucket Server / Data Center style: /projects/{project}/repos/{repo}/...
+    lowered_parts = [part.lower() for part in parts]
+    if "projects" in lowered_parts and "repos" in lowered_parts:
+        project_idx = lowered_parts.index("projects")
+        repo_idx = lowered_parts.index("repos")
+        if project_idx + 1 < len(parts) and repo_idx + 1 < len(parts):
+            workspace = parts[project_idx + 1].strip()
+            repo_slug = parts[repo_idx + 1].strip().removesuffix(".git")
+            return workspace, repo_slug
+
+    # Generic fallback for self-hosted paths: use first two path segments.
+    workspace = parts[0].strip()
+    repo_slug = parts[1].strip().removesuffix(".git")
+    return workspace, repo_slug
 
 
 def _extract_issue_id_from_url(value: str) -> str:
@@ -148,6 +192,16 @@ def detect_sources(
 
     if isinstance(raw_alert, str):
         raw_alert = {}
+
+    resolved_integrations = inject_opensre_into_resolved_integrations(
+        raw_alert, resolved_integrations
+    )
+
+    opensre_csv_backend_active = False
+    if resolved_integrations:
+        _gg = resolved_integrations.get("grafana")
+        if isinstance(_gg, dict) and _gg.get("_backend") is not None:
+            opensre_csv_backend_active = isinstance(_gg["_backend"], OpenSRECsvGrafanaBackend)
 
     # Determine alert origin platform to avoid querying irrelevant integrations
     alert_source = raw_alert.get("alert_source", "").lower() if isinstance(raw_alert, dict) else ""
@@ -349,14 +403,16 @@ def detect_sources(
             or "us-east-1"
         )
 
-    if aws_metadata:
+    if aws_metadata and not opensre_csv_backend_active:
         sources["aws_metadata"] = aws_metadata
 
     # Detect Grafana sources from resolved_integrations
     common_labels = raw_alert.get("commonLabels", {}) if isinstance(raw_alert, dict) else {}
+    # Prefer label pipeline (authoritative on webhooks / Hub JSON) over LLM-enriched
+    # top-level pipeline_name, which is often shortened (e.g. "cloudbed-1").
     pipeline_name = (
-        annotations.get("pipeline_name")
-        or common_labels.get("pipeline_name")
+        common_labels.get("pipeline_name")
+        or annotations.get("pipeline_name")
         or context.get("pipeline_name", "")
     )
     execution_run_id = (
@@ -384,11 +440,53 @@ def detect_sources(
     grafana_int = None
     grafana_local = False
     if resolved_integrations:
-        if resolved_integrations.get("grafana_local"):
-            grafana_int = resolved_integrations["grafana_local"]
-            grafana_local = True
-        elif resolved_integrations.get("grafana"):
-            grafana_int = resolved_integrations["grafana"]
+        # Multi-instance support: an alert may carry a ``grafana_instance`` hint
+        # naming a specific configured instance (e.g. ``"prod"``, ``"staging"``).
+        # When the hint matches, select that instance; otherwise fall back to
+        # the default (first) instance. See app/integrations/selectors.py.
+        grafana_hint: str | None = None
+        if isinstance(raw_alert, dict):
+            hint_candidate = raw_alert.get("grafana_instance")
+            if not hint_candidate:
+                nested = raw_alert.get("annotations")
+                if isinstance(nested, dict):
+                    hint_candidate = nested.get("grafana_instance")
+            if hint_candidate:
+                grafana_hint = str(hint_candidate).strip().lower() or None
+
+        if grafana_hint:
+            from app.integrations.selectors import get_instance_by_name
+
+            selected = get_instance_by_name(resolved_integrations, "grafana", grafana_hint)
+            if selected is not None:
+                grafana_int = selected
+                # The classifier strips api_key to "" for local grafana and
+                # rejects cloud grafana with an empty api_key, so an empty
+                # api_key in a classified instance uniquely identifies a
+                # local instance. Mirror the local flag so downstream gating
+                # (loki_only, anonymous-auth acceptance) works the same as
+                # the non-hint fallback path.
+                if not selected.get("api_key"):
+                    grafana_local = True
+            else:
+                # A hint that does not resolve is almost always a typo or a
+                # removed instance — warn so operators notice instead of
+                # silently querying the wrong Grafana.
+                logger.warning(
+                    "grafana_instance hint %r not found; falling back to default instance",
+                    grafana_hint,
+                )
+
+        if grafana_int is None:
+            grafana_cloud = resolved_integrations.get("grafana")
+            if isinstance(grafana_cloud, dict) and grafana_cloud.get("_backend") is not None:
+                grafana_int = grafana_cloud
+                grafana_local = False
+            elif resolved_integrations.get("grafana_local"):
+                grafana_int = resolved_integrations["grafana_local"]
+                grafana_local = True
+            elif grafana_cloud:
+                grafana_int = grafana_cloud
 
     # When a _backend is injected we allow any alert_source; otherwise restrict to Grafana/unknown.
     _has_injected_backend = bool(grafana_int and "_backend" in grafana_int)
@@ -418,17 +516,21 @@ def detect_sources(
                 grafana_params["_backend"] = grafana_int["_backend"]
             sources["grafana"] = grafana_params
 
-    # Only include Datadog when alert came from Datadog, or when source is truly unknown
-    if (
-        resolved_integrations
-        and resolved_integrations.get("datadog")
-        and alert_source in ("datadog", "")
-    ):
+    # Only include Datadog when alert came from Datadog, or when source is truly unknown,
+    # or when a pre-injected backend is present (e.g. FixtureDatadogBackend for synthetic tests).
+    dd_int = None
+    if resolved_integrations and resolved_integrations.get("datadog"):
         dd_int = resolved_integrations["datadog"]
+
+    _has_injected_dd_backend = bool(dd_int and "_backend" in dd_int)
+    if dd_int and not (_has_injected_dd_backend or alert_source in ("datadog", "")):
+        dd_int = None  # suppress real Datadog for non-Datadog alerts
+
+    if dd_int:
         dd_api_key = dd_int.get("api_key", "")
         dd_app_key = dd_int.get("app_key", "")
 
-        if dd_api_key and dd_app_key:
+        if _has_injected_dd_backend or (dd_api_key and dd_app_key):
             # kube_namespace: prefer LLM-injected top-level field, fall back to annotations
             kube_namespace = raw_alert.get("kube_namespace", "") or annotations.get(
                 "kube_namespace", ""
@@ -462,12 +564,17 @@ def detect_sources(
                 "api_key": dd_api_key,
                 "app_key": dd_app_key,
                 "site": dd_int.get("site", "datadoghq.com"),
-                "connection_verified": True,
                 "pipeline_name": pipeline_name,
                 "default_query": default_query,
                 "monitor_query": f"tag:pipeline:{pipeline_name}" if pipeline_name else None,
                 "time_range_minutes": alert_time_range_minutes,
             }
+            if _has_injected_dd_backend:
+                # Backend-only path: only fixture-aware Datadog tools should activate,
+                # so connection_verified stays unset to keep the real-Datadog tools quiet.
+                dd_params["_backend"] = dd_int["_backend"]
+            else:
+                dd_params["connection_verified"] = True
 
             kube_job = annotations.get("kube_job", "") or annotations.get("kube_job_name", "")
             kube_deployment = annotations.get("kube_deployment", "")
@@ -564,10 +671,25 @@ def detect_sources(
                 "connection_verified": True,
             }
 
-    # Detect EKS: uses the AWS integration (EKS maps to aws in resolve_integrations)
+    # Detect EKS: uses the AWS integration (EKS maps to aws in resolve_integrations).
+    # A pre-injected _backend (e.g. FixtureEKSBackend for synthetic tests) bypasses
+    # the role_arn credential gate the same way the Grafana path does.
     _eks_int = (resolved_integrations or {}).get("aws")
-    if _eks_int and _eks_int.get("role_arn"):
+    _has_injected_eks_backend = bool(_eks_int and "_backend" in _eks_int)
+    if _eks_int and (
+        _eks_int.get("role_arn") or _has_injected_eks_backend or _eks_int.get("credentials")
+    ):
         eks_cluster = annotations.get("eks_cluster") or annotations.get("cluster_name")
+        # When a backend is injected but the alert omits cluster_name from its
+        # annotations, fall back to the first cluster_names entry on the
+        # integration dict.  Without this fallback, backend-only investigations
+        # silently produce zero EKS tool activity — future synthetic scenarios
+        # that forget to put cluster_name in commonAnnotations would otherwise
+        # fail with no diagnostic.
+        if not eks_cluster and _has_injected_eks_backend:
+            cluster_names = _eks_int.get("cluster_names") or []
+            if cluster_names:
+                eks_cluster = cluster_names[0]
         kube_namespace = (
             annotations.get("kube_namespace")
             or annotations.get("kubernetes_namespace")
@@ -576,7 +698,7 @@ def detect_sources(
         )
 
         if eks_cluster:
-            sources["eks"] = {
+            eks_params: dict[str, Any] = {
                 "cluster_name": eks_cluster,
                 "namespace": kube_namespace,
                 "pod_name": annotations.get("pod_name", ""),
@@ -589,9 +711,174 @@ def detect_sources(
                     or annotations.get("region")
                     or _eks_int.get("region", "us-east-1")
                 ),
-                "role_arn": _eks_int["role_arn"],
+                "role_arn": _eks_int.get("role_arn", ""),
                 "external_id": _eks_int.get("external_id", ""),
                 "cluster_names": _eks_int.get("cluster_names", []),
+                # Forward stored AWS integration credentials so build_k8s_clients
+                # can use them explicitly instead of silently missing them when
+                # the AWS integration is configured with IAM user credentials
+                # (access_key_id + secret_access_key, no role_arn). Follow-up
+                # to #724 (stored-integration credential forwarding).
+                "credentials": _eks_int.get("credentials") or None,
+            }
+            if _has_injected_eks_backend:
+                # Backend-only path: only fixture-aware EKS tools should activate,
+                # so connection_verified stays unset to keep the real-AWS tools quiet.
+                eks_params["_backend"] = _eks_int["_backend"]
+            else:
+                eks_params["connection_verified"] = True
+            sources["eks"] = eks_params
+
+    bitbucket_int = (resolved_integrations or {}).get("bitbucket")
+    if bitbucket_int and alert_source in ("bitbucket", ""):
+        repo_url = str(
+            annotations.get("repo_url")
+            or annotations.get("repository_url")
+            or raw_alert.get("repo_url", "")
+        )
+        workspace = str(
+            annotations.get("bitbucket_workspace") or bitbucket_int.get("workspace", "")
+        ).strip()
+        repo_slug = str(
+            annotations.get("bitbucket_repo_slug")
+            or annotations.get("bitbucket_repo")
+            or annotations.get("repo_slug")
+            or raw_alert.get("bitbucket_repo", "")
+        ).strip()
+        parsed_workspace, parsed_repo = _parse_bitbucket_repo_url(repo_url)
+        if not workspace:
+            workspace = parsed_workspace
+        if not repo_slug:
+            repo_slug = parsed_repo
+
+        if workspace and repo_slug:
+            bitbucket_query = str(
+                annotations.get("bitbucket_query")
+                or annotations.get("code_query")
+                or raw_alert.get("error_message", "")
+                or raw_alert.get("alert_name", "")
+            ).strip()
+            sources["bitbucket"] = {
+                "workspace": workspace,
+                "repo_slug": repo_slug,
+                "path": str(
+                    annotations.get("bitbucket_path")
+                    or annotations.get("file_path")
+                    or raw_alert.get("file_path", "")
+                ).strip(),
+                "ref": str(
+                    annotations.get("branch")
+                    or annotations.get("bitbucket_ref")
+                    or raw_alert.get("branch", "")
+                ).strip(),
+                "query": bitbucket_query or "exception OR error",
+                "username": str(bitbucket_int.get("username", "")).strip(),
+                "app_password": str(bitbucket_int.get("app_password", "")).strip(),
+                "base_url": str(
+                    bitbucket_int.get("base_url", "https://api.bitbucket.org/2.0")
+                ).strip()
+                or "https://api.bitbucket.org/2.0",
+                "max_results": _safe_int(bitbucket_int.get("max_results", 25), 25),
+                "integration_id": str(bitbucket_int.get("integration_id", "")).strip(),
+                "connection_verified": True,
+            }
+
+    snowflake_int = (resolved_integrations or {}).get("snowflake")
+    if snowflake_int and alert_source in ("snowflake", ""):
+        account_identifier = str(snowflake_int.get("account_identifier", "")).strip()
+        token = str(snowflake_int.get("token", "")).strip()
+        if account_identifier and token:
+            sources["snowflake"] = {
+                "account_identifier": account_identifier,
+                "user": str(snowflake_int.get("user", "")).strip(),
+                "password": str(snowflake_int.get("password", "")).strip(),
+                "token": token,
+                "warehouse": str(snowflake_int.get("warehouse", "")).strip(),
+                "role": str(snowflake_int.get("role", "")).strip(),
+                "database": str(snowflake_int.get("database", "")).strip(),
+                "schema": str(snowflake_int.get("schema", "")).strip(),
+                "query": str(
+                    annotations.get("snowflake_query")
+                    or raw_alert.get("error_message", "")
+                    or raw_alert.get("alert_name", "")
+                ).strip(),
+                "max_results": _safe_int(snowflake_int.get("max_results", 50), 50),
+                "integration_id": str(snowflake_int.get("integration_id", "")).strip(),
+                "connection_verified": True,
+            }
+
+    azure_int = (resolved_integrations or {}).get("azure")
+    if azure_int and alert_source in ("azure", "azure_monitor", ""):
+        workspace_id = str(azure_int.get("workspace_id", "")).strip()
+        access_token = str(azure_int.get("access_token", "")).strip()
+        if workspace_id and access_token:
+            sources["azure"] = {
+                "workspace_id": workspace_id,
+                "access_token": access_token,
+                "endpoint": str(azure_int.get("endpoint", "https://api.loganalytics.io")).strip()
+                or "https://api.loganalytics.io",
+                "query": str(
+                    annotations.get("azure_query")
+                    or annotations.get("kql_query")
+                    or raw_alert.get("error_message", "")
+                    or raw_alert.get("alert_name", "")
+                ).strip(),
+                "time_range_minutes": alert_time_range_minutes,
+                "max_results": _safe_int(azure_int.get("max_results", 100), 100),
+                "integration_id": str(azure_int.get("integration_id", "")).strip(),
+                "connection_verified": True,
+            }
+
+    openobserve_int = (resolved_integrations or {}).get("openobserve")
+    if openobserve_int and alert_source in ("openobserve", ""):
+        base_url = str(openobserve_int.get("base_url", "")).strip()
+        api_token = str(openobserve_int.get("api_token", "")).strip()
+        username = str(openobserve_int.get("username", "")).strip()
+        password = str(openobserve_int.get("password", "")).strip()
+        if base_url and (api_token or (username and password)):
+            sources["openobserve"] = {
+                "base_url": base_url.rstrip("/"),
+                "org": str(openobserve_int.get("org", "default")).strip() or "default",
+                "stream": str(
+                    annotations.get("openobserve_stream") or openobserve_int.get("stream", "")
+                ).strip(),
+                "query": str(
+                    annotations.get("openobserve_query")
+                    or raw_alert.get("error_message", "")
+                    or raw_alert.get("alert_name", "")
+                ).strip(),
+                "api_token": api_token,
+                "username": username,
+                "password": password,
+                "time_range_minutes": alert_time_range_minutes,
+                "max_results": _safe_int(openobserve_int.get("max_results", 100), 100),
+                "integration_id": str(openobserve_int.get("integration_id", "")).strip(),
+                "connection_verified": True,
+            }
+
+    opensearch_int = (resolved_integrations or {}).get("opensearch")
+    if opensearch_int and alert_source in ("opensearch", "elasticsearch", ""):
+        opensearch_url = str(opensearch_int.get("url", "")).strip()
+        if opensearch_url:
+            default_query = str(
+                annotations.get("opensearch_query")
+                or annotations.get("elasticsearch_query")
+                or annotations.get("query")
+                or raw_alert.get("error_message", "")
+                or raw_alert.get("alert_name", "")
+            ).strip()
+            sources["opensearch"] = {
+                "url": opensearch_url.rstrip("/"),
+                "api_key": str(opensearch_int.get("api_key", "")).strip(),
+                "index_pattern": str(
+                    annotations.get("opensearch_index_pattern")
+                    or opensearch_int.get("index_pattern", "*")
+                ).strip()
+                or "*",
+                "default_query": default_query or "*",
+                "time_range_minutes": alert_time_range_minutes,
+                "max_results": _safe_int(opensearch_int.get("max_results", 100), 100),
+                "integration_id": str(opensearch_int.get("integration_id", "")).strip(),
                 "connection_verified": True,
             }
 
@@ -668,6 +955,31 @@ def detect_sources(
                 "connection_verified": True,
             }
 
+    openclaw_int = (resolved_integrations or {}).get("openclaw")
+    if openclaw_int:
+        openclaw_url = str(openclaw_int.get("url", "")).strip()
+        openclaw_command = str(openclaw_int.get("command", "")).strip()
+        if openclaw_url or openclaw_command:
+            openclaw_search_query = str(
+                annotations.get("openclaw_search")
+                or raw_alert.get("openclaw_search", "")
+                or service_name
+                or pipeline_name
+                or raw_alert.get("alert_name", "")
+                or raw_alert.get("title", "")
+                or annotations.get("summary", "")
+            ).strip()
+            sources["openclaw"] = {
+                "openclaw_url": openclaw_url,
+                "openclaw_mode": str(openclaw_int.get("mode", "streamable-http")).strip()
+                or "streamable-http",
+                "openclaw_token": str(openclaw_int.get("auth_token", "")).strip(),
+                "openclaw_command": openclaw_command,
+                "openclaw_args": openclaw_int.get("args", []),
+                "openclaw_search_query": openclaw_search_query,
+                "connection_verified": True,
+            }
+
     gitlab_int = (resolved_integrations or {}).get("gitlab")
     if gitlab_int:
         repo_url = str(
@@ -701,9 +1013,7 @@ def detect_sources(
                     or raw_alert.get("file_path", "")
                 ).strip(),
                 "since": _alert_since_iso(raw_alert),
-                "updated_after": str(
-                    annotations.get("startsAt") or raw_alert.get("startsAt", "")
-                ).strip(),
+                "updated_after": _alert_since_iso(raw_alert),
                 "gitlab_url": str(gitlab_int.get("base_url", "")).strip(),
                 "gitlab_token": str(gitlab_int.get("auth_token", "")).strip(),
                 "merge_request_iid": str(annotations.get("mr_iid", "")).strip(),
@@ -858,6 +1168,79 @@ def detect_sources(
             "connection_verified": True,
         }
 
+    mariadb_int = (resolved_integrations or {}).get("mariadb")
+    if (
+        mariadb_int
+        and str(mariadb_int.get("host", "")).strip()
+        and str(mariadb_int.get("database", "")).strip()
+    ):
+        sources["mariadb"] = {
+            "host": str(mariadb_int.get("host", "")).strip(),
+            "port": mariadb_int.get("port", 3306),
+            "database": str(mariadb_int.get("database", "")).strip(),
+            "username": str(mariadb_int.get("username", "")).strip(),
+            "password": str(mariadb_int.get("password", "")).strip(),
+            "ssl": mariadb_int.get("ssl", True),
+            "connection_verified": True,
+        }
+
+    rabbitmq_int = (resolved_integrations or {}).get("rabbitmq")
+    if (
+        rabbitmq_int
+        and str(rabbitmq_int.get("host", "")).strip()
+        and str(rabbitmq_int.get("username", "")).strip()
+    ):
+        sources["rabbitmq"] = {
+            "host": str(rabbitmq_int.get("host", "")).strip(),
+            "management_port": rabbitmq_int.get("management_port", 15672),
+            "username": str(rabbitmq_int.get("username", "")).strip(),
+            "password": str(rabbitmq_int.get("password") or ""),
+            "vhost": str(rabbitmq_int.get("vhost", "/")).strip() or "/",
+            "ssl": rabbitmq_int.get("ssl", False),
+            "verify_ssl": rabbitmq_int.get("verify_ssl", True),
+            "connection_verified": True,
+        }
+
+    betterstack_int = (resolved_integrations or {}).get("betterstack")
+    if (
+        betterstack_int
+        and str(betterstack_int.get("query_endpoint", "")).strip()
+        and str(betterstack_int.get("username", "")).strip()
+    ):
+        # Alerts can carry an explicit ``betterstack_source`` annotation (the base
+        # identifier of the source to query). We surface it as ``source_hint`` so
+        # ``betterstack_extract_params`` can pass it into the tool as the runtime
+        # ``source`` kwarg — otherwise the executor has no path to propagate
+        # alert-derived source targeting into the tool.
+        source_hint = str(annotations.get("betterstack_source") or "").strip()
+        sources["betterstack"] = {
+            "query_endpoint": str(betterstack_int.get("query_endpoint", "")).strip(),
+            "username": str(betterstack_int.get("username", "")).strip(),
+            "password": str(betterstack_int.get("password") or ""),
+            "sources": list(betterstack_int.get("sources", []) or []),
+            "source_hint": source_hint,
+            "connection_verified": True,
+        }
+
+    alertmanager_int = (resolved_integrations or {}).get("alertmanager")
+    if alertmanager_int and str(alertmanager_int.get("base_url", "")).strip():
+        # Carry label filters from the alert when present so tools can pre-scope the query
+        filter_labels: list[str] = []
+        alertname = str(
+            common_labels.get("alertname") or annotations.get("alertname") or ""
+        ).strip()
+        if alertname:
+            escaped = alertname.replace("\\", "\\\\").replace('"', '\\"')
+            filter_labels.append(f'alertname="{escaped}"')
+        sources["alertmanager"] = {
+            "base_url": str(alertmanager_int.get("base_url", "")).strip().rstrip("/"),
+            "bearer_token": str(alertmanager_int.get("bearer_token", "")).strip(),
+            "username": str(alertmanager_int.get("username", "")).strip(),
+            "password": str(alertmanager_int.get("password", "")).strip(),
+            "filter_labels": filter_labels,
+            "connection_verified": True,
+        }
+
     opsgenie_int = (resolved_integrations or {}).get("opsgenie")
     if opsgenie_int and str(opsgenie_int.get("api_key", "")).strip():
         alert_id = str(
@@ -871,6 +1254,67 @@ def detect_sources(
             "region": str(opsgenie_int.get("region", "us")).strip(),
             "alert_id": alert_id,
             "query": opsgenie_query,
+            "connection_verified": True,
+        }
+
+    jira_int = (resolved_integrations or {}).get("jira")
+    if (
+        jira_int
+        and str(jira_int.get("base_url", "")).strip()
+        and str(jira_int.get("email", "")).strip()
+        and str(jira_int.get("api_token", "")).strip()
+    ):
+        sources["jira"] = {
+            "base_url": str(jira_int.get("base_url", "")).strip(),
+            "email": str(jira_int.get("email", "")).strip(),
+            "api_token": str(jira_int.get("api_token", "")).strip(),
+            "project_key": str(jira_int.get("project_key", "")).strip(),
+            "connection_verified": True,
+        }
+
+    mysql_int = (resolved_integrations or {}).get("mysql")
+    if (
+        mysql_int
+        and str(mysql_int.get("host", "")).strip()
+        and str(mysql_int.get("database", "")).strip()
+    ):
+        mysql_host = str(mysql_int.get("host", "")).strip()
+        mysql_database = str(mysql_int.get("database", "")).strip()
+        mysql_database = str(
+            annotations.get("mysql_database") or annotations.get("database") or mysql_database
+        ).strip()
+        mysql_table = str(annotations.get("mysql_table") or annotations.get("table") or "").strip()
+        sources["mysql"] = {
+            "host": mysql_host,
+            "port": mysql_int.get("port", 3306),
+            "database": mysql_database,
+            "table": mysql_table,
+            "connection_verified": True,
+        }
+
+    azure_sql_int = (resolved_integrations or {}).get("azure_sql")
+    if (
+        azure_sql_int
+        and str(azure_sql_int.get("server", "")).strip()
+        and str(azure_sql_int.get("database", "")).strip()
+    ):
+        azure_sql_server = str(azure_sql_int.get("server", "")).strip()
+        # Prefer the alert-specified database (multi-tenant Azure SQL pools often
+        # name the affected database in annotations), fall back to the configured
+        # database from the integration store.  Credentials stay in
+        # resolve_azure_sql_config — do not leak them here.
+        azure_sql_database = (
+            str(annotations.get("azure_sql_database") or "").strip()
+            or str(annotations.get("database") or "").strip()
+            or str(azure_sql_int.get("database", "")).strip()
+        )
+        # `or DEFAULT_AZURE_SQL_PORT` rather than `get("port", ...)` so an
+        # explicit-None stored port collapses to the default (matches
+        # azure_sql_extract_params in app/integrations/azure_sql.py).
+        sources["azure_sql"] = {
+            "server": azure_sql_server,
+            "port": azure_sql_int.get("port") or DEFAULT_AZURE_SQL_PORT,
+            "database": azure_sql_database,
             "connection_verified": True,
         }
 

@@ -44,6 +44,7 @@ def _deployment_status_extract_params(sources: dict[str, dict]) -> dict[str, Any
             "role_arn": {"type": "string"},
             "external_id": {"type": "string", "default": ""},
             "region": {"type": "string", "default": "us-east-1"},
+            "credentials": {"type": ["object", "null"], "default": None},
         },
         "required": ["cluster_name", "namespace", "deployment_name", "role_arn"],
     },
@@ -57,22 +58,49 @@ def get_eks_deployment_status(
     role_arn: str,
     external_id: str = "",
     region: str = "us-east-1",
+    credentials: dict[str, Any] | None = None,
     **_kwargs: Any,
 ) -> dict[str, Any]:
     """Get EKS deployment rollout status — desired vs ready vs unavailable replicas."""
-    logger.info("[eks] get_eks_deployment_status cluster=%s ns=%s deployment=%s", cluster_name, namespace, deployment_name)
+    logger.info(
+        "[eks] get_eks_deployment_status cluster=%s ns=%s deployment=%s",
+        cluster_name,
+        namespace,
+        deployment_name,
+    )
     try:
-        _, apps_v1 = build_k8s_clients(cluster_name, role_arn, external_id, region)
+        _, apps_v1 = build_k8s_clients(
+            cluster_name,
+            role_arn,
+            external_id,
+            region,
+            credentials=credentials,
+        )
         dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
         spec = dep.spec
         status = dep.status
-        conditions = [{"type": c.type, "status": c.status, "reason": c.reason, "message": c.message} for c in (status.conditions or [])]
+        conditions = [
+            {"type": c.type, "status": c.status, "reason": c.reason, "message": c.message}
+            for c in (status.conditions or [])
+        ]
         return {
-            "source": "eks", "available": True, "cluster_name": cluster_name, "namespace": namespace,
-            "deployment_name": deployment_name, "desired_replicas": spec.replicas,
-            "ready_replicas": status.ready_replicas, "available_replicas": status.available_replicas,
-            "unavailable_replicas": status.unavailable_replicas, "conditions": conditions, "error": None,
+            "source": "eks",
+            "available": True,
+            "cluster_name": cluster_name,
+            "namespace": namespace,
+            "deployment_name": deployment_name,
+            "desired_replicas": spec.replicas,
+            "ready_replicas": status.ready_replicas,
+            "available_replicas": status.available_replicas,
+            "unavailable_replicas": status.unavailable_replicas,
+            "conditions": conditions,
+            "error": None,
         }
     except Exception as e:
         logger.error("[eks] get_eks_deployment_status FAILED: %s", e, exc_info=True)
-        return {"source": "eks", "available": False, "deployment_name": deployment_name, "error": str(e)}
+        return {
+            "source": "eks",
+            "available": False,
+            "deployment_name": deployment_name,
+            "error": str(e),
+        }

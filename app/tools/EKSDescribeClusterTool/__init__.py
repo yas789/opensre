@@ -40,6 +40,7 @@ def _describe_cluster_extract_params(sources: dict[str, dict]) -> dict[str, Any]
             "role_arn": {"type": "string"},
             "external_id": {"type": "string", "default": ""},
             "region": {"type": "string", "default": "us-east-1"},
+            "credentials": {"type": ["object", "null"], "default": None},
         },
         "required": ["cluster_name", "role_arn"],
     },
@@ -51,19 +52,31 @@ def describe_eks_cluster(
     role_arn: str,
     external_id: str = "",
     region: str = "us-east-1",
+    credentials: dict[str, Any] | None = None,
     **_kwargs: Any,
 ) -> dict[str, Any]:
     """Describe an EKS cluster — health, version, status, endpoint, logging config."""
     logger.info("[eks] describe_eks_cluster cluster=%s region=%s", cluster_name, region)
     try:
-        client = EKSClient(role_arn=role_arn, external_id=external_id, region=region)
+        client = EKSClient(
+            role_arn=role_arn,
+            external_id=external_id,
+            region=region,
+            credentials=credentials,
+        )
         cluster = client.describe_cluster(cluster_name)
         return {
-            "source": "eks", "available": True, "cluster_name": cluster_name,
-            "status": cluster.get("status"), "kubernetes_version": cluster.get("version"),
-            "endpoint": cluster.get("endpoint"), "cluster_role_arn": cluster.get("roleArn"),
-            "logging": cluster.get("logging", {}), "resources_vpc_config": cluster.get("resourcesVpcConfig", {}),
-            "tags": cluster.get("tags", {}), "error": None,
+            "source": "eks",
+            "available": True,
+            "cluster_name": cluster_name,
+            "status": cluster.get("status"),
+            "kubernetes_version": cluster.get("version"),
+            "endpoint": cluster.get("endpoint"),
+            "cluster_role_arn": cluster.get("roleArn"),
+            "logging": cluster.get("logging", {}),
+            "resources_vpc_config": cluster.get("resourcesVpcConfig", {}),
+            "tags": cluster.get("tags", {}),
+            "error": None,
         }
     except ClientError as e:
         return {"source": "eks", "available": False, "cluster_name": cluster_name, "error": str(e)}

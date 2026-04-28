@@ -10,14 +10,21 @@
 
 1. Fork and clone the repo:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/open-sre-agent.git
-   cd open-sre-agent
+   git clone https://github.com/YOUR_USERNAME/opensre.git
+   cd opensre
    ```
 
 2. Create a virtual environment:
+   - (venv)
    ```bash
    python -m venv .venv
    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   ```
+   - (conda)
+   ```bash
+   # replace "opensre" if needed
+   conda create -n opensre python=3.11
+   conda activate opensre
    ```
 
 3. Install dependencies:
@@ -31,6 +38,23 @@
    ```
 
 All three must pass before you're ready to develop.
+
+---
+
+## VS Code Dev Container Setup
+
+If you use VS Code, you can skip the manual Python setup and use the repo's devcontainer instead:
+
+1. Install the **Dev Containers** extension in VS Code.
+2. Start Docker Desktop, OrbStack, Colima, or another Docker-compatible runtime on your host machine.
+3. Open the repository in VS Code and run `Dev Containers: Reopen in Container`.
+4. Wait for the container's `postCreateCommand` to install `.[dev]`.
+5. Run the usual checks:
+   ```bash
+   make lint && make typecheck && make test-cov
+   ```
+
+The devcontainer uses Python 3.13 to match CI and `.tool-versions`. Manual host-based setup continues to work with any supported Python version (`>=3.11`).
 
 ---
 
@@ -133,9 +157,18 @@ You can start the MCP server with:
 opensre-mcp
 ```
 
-This exposes the `run_rca` tool for MCP clients (e.g., OpenClaw).
+This exposes the `run_rca` tool for MCP clients.
 
-### OpenClaw MCP Configuration (Example)
+---
+
+## Connecting OpenClaw
+
+Use OpenClaw to call OpenSRE's `run_rca` tool.
+
+### 1. Add OpenSRE to OpenClaw
+
+In OpenClaw, open **Settings → MCP Servers** and add:
+
 ```json
 {
   "mcpServers": {
@@ -147,7 +180,44 @@ This exposes the `run_rca` tool for MCP clients (e.g., OpenClaw).
 }
 ```
 
-### Demo Alert Payload
+If `opensre-mcp` is not on your `PATH`, use the full path:
+```json
+{ "command": "/path/to/venv/bin/opensre-mcp" }
+```
 
-A realistic example alert payload is available at:
-`tests/e2e/kubernetes/fixtures/datadog_k8s_alert.json`
+### 2. Configure one observability integration
+
+Run the setup wizard once and connect Datadog, Grafana, Sentry, or another backend:
+
+```bash
+opensre integrations setup
+```
+
+### 3. Run a test
+
+Run the fixture directly from the CLI:
+
+```bash
+opensre investigate -i tests/fixtures/openclaw_test_alert.json
+```
+
+### 4. Optional: let OpenSRE call OpenClaw
+
+If you want the OpenSRE investigation pipeline to query OpenClaw during RCA runs:
+
+```bash
+export OPENCLAW_MCP_MODE=stdio
+export OPENCLAW_MCP_COMMAND=openclaw
+export OPENCLAW_MCP_ARGS="mcp serve"
+```
+
+Keep the OpenClaw Gateway running while you investigate:
+
+```bash
+openclaw gateway run
+```
+
+Verify:
+```bash
+opensre integrations verify openclaw
+```

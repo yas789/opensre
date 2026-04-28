@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -23,13 +24,13 @@ _EVIDENCE_KEY_MAP: dict[str, str] = {
 
 @dataclass(frozen=True)
 class TrajectoryScore:
-    actual_sequence: list[str]    # flattened actions from executed_hypotheses
+    actual_sequence: list[str]  # flattened actions from executed_hypotheses
     expected_sequence: list[str]  # from answer_key.optimal_trajectory
     loops_used: int
     max_loops: int
-    sequencing_ok: bool           # all expected actions appear in actual (set membership)
-    calibration_ok: bool          # loops_used <= max_loops
-    efficiency_score: float       # mean(sequencing_ok, calibration_ok)
+    sequencing_ok: bool  # all expected actions appear in actual (set membership)
+    calibration_ok: bool  # loops_used <= max_loops
+    efficiency_score: float  # mean(sequencing_ok, calibration_ok)
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class ReasoningScore:
     queries_ok: every required_queries metric name was requested via query_timeseries.
     reasoning_score: mean(ruling_out_ok, queries_ok); 1.0 = full pass.
     """
+
     ruling_out_ok: bool
     queries_ok: bool
     missing_ruling_out: list[str]
@@ -115,6 +117,69 @@ def _normalize_text(value: str) -> str:
     return " ".join(value.lower().split())
 
 
+def _normalize_query_token(value: str) -> str:
+    return _normalize_text(value).replace(" ", "_").replace("-", "_")
+
+
+def _matches_required_keyword(normalized_output: str, keyword: str) -> bool:
+    normalized_keyword = _normalize_text(keyword)
+    if normalized_keyword in normalized_output:
+        return True
+
+    keyword_aliases = {
+        "max_connections": (
+            "maximum allowed connections",
+            "max allowed connections",
+            "allowed connections",
+            "connection slots",
+        ),
+        "performanceinsights": (
+            "top sql activity",
+            "avg load",
+            "aas",
+            "active sessions",
+            "db load",
+        ),
+        "client sessions": (
+            "client session",
+            "idle database sessions",
+            "database sessions",
+        ),
+        "idle": (
+            "clientread",
+            "waiting for client response",
+            "sessions remain open",
+            "open sessions",
+        ),
+    }
+    for alias in keyword_aliases.get(normalized_keyword.replace(" ", ""), ()):
+        if _normalize_text(alias) in normalized_output:
+            return True
+
+    keyword_tokens = set(re.findall(r"[a-z0-9]+", normalized_keyword))
+    if not keyword_tokens:
+        return False
+
+    output_tokens = set(re.findall(r"[a-z0-9]+", normalized_output))
+    return keyword_tokens.issubset(output_tokens)
+
+
+def _scored_output_text(final_state: dict[str, Any]) -> str:
+    """Return the broadest textual output we should grade for synthetic scenarios."""
+    return " ".join(
+        [
+            str(final_state.get("root_cause") or ""),
+            " ".join(claim.get("claim", "") for claim in final_state.get("validated_claims", [])),
+            " ".join(
+                claim.get("claim", "") for claim in final_state.get("non_validated_claims", [])
+            ),
+            " ".join(final_state.get("causal_chain", [])),
+            str(final_state.get("report") or ""),
+            str((final_state.get("problem_report") or {}).get("report_md") or ""),
+        ]
+    )
+
+
 def score_trajectory(
     fixture: ScenarioFixture,
     final_state: dict[str, Any],
@@ -181,33 +246,22 @@ def score_reasoning(
         return None
 
     # --- ruling_out_keywords: check each token appears anywhere in agent output ---
-    evidence_text = " ".join(
-        [
-            str(final_state.get("root_cause") or ""),
-            " ".join(
-                claim.get("claim", "") for claim in final_state.get("validated_claims", [])
-            ),
-            " ".join(
-                claim.get("claim", "") for claim in final_state.get("non_validated_claims", [])
-            ),
-            " ".join(final_state.get("causal_chain", [])),
-        ]
-    )
+    evidence_text = _scored_output_text(final_state)
     normalized_output = _normalize_text(evidence_text)
 
     missing_ruling_out: list[str] = []
     if has_ruling_out:
         for token in fixture.answer_key.ruling_out_keywords:
-            if token.lower() not in normalized_output:
+            if not _matches_required_keyword(normalized_output, token):
                 missing_ruling_out.append(token)
 
     # --- required_queries: each token must appear in at least one queried metric name ---
     missing_queries: list[str] = []
     if has_required_queries:
-        audited = queried_metrics or []
+        audited = {_normalize_query_token(item) for item in (queried_metrics or [])}
         for required in fixture.answer_key.required_queries:
-            token = required.lower()
-            if not any(token in q.lower() for q in audited):
+            token = _normalize_query_token(required)
+            if not any(token in q for q in audited):
                 missing_queries.append(required)
 
     ruling_out_ok = not missing_ruling_out
@@ -232,24 +286,13 @@ def score_result(
     actual_category = str(final_state.get("root_cause_category") or "unknown").strip()
     root_cause_present = bool(root_cause and root_cause.lower() != "unable to determine root cause")
 
-    evidence_text = " ".join(
-        [
-            root_cause,
-            " ".join(
-                claim.get("claim", "") for claim in final_state.get("validated_claims", [])
-            ),
-            " ".join(
-                claim.get("claim", "") for claim in final_state.get("non_validated_claims", [])
-            ),
-            " ".join(final_state.get("causal_chain", [])),
-        ]
-    )
+    evidence_text = _scored_output_text(final_state)
     normalized_output = _normalize_text(evidence_text)
 
     matched_keywords = [
         keyword
         for keyword in fixture.answer_key.required_keywords
-        if _normalize_text(keyword) in normalized_output
+        if _matches_required_keyword(normalized_output, keyword)
     ]
     missing_keywords = [
         keyword
@@ -264,7 +307,9 @@ def score_result(
     if not root_cause_present:
         failure_reason = "no root cause in output"
     elif actual_category != answer_key.root_cause_category:
-        failure_reason = f"wrong category: got {actual_category!r}, expected {answer_key.root_cause_category!r}"
+        failure_reason = (
+            f"wrong category: got {actual_category!r}, expected {answer_key.root_cause_category!r}"
+        )
     elif missing_keywords:
         failure_reason = f"missing required keywords: {missing_keywords}"
     # 2. Forbidden category check (level 2+ adversarial)
@@ -273,8 +318,7 @@ def score_result(
     # 3. Forbidden keyword check — none of these may appear in evidence_text
     elif answer_key.forbidden_keywords:
         forbidden_hits = [
-            kw for kw in answer_key.forbidden_keywords
-            if _normalize_text(kw) in normalized_output
+            kw for kw in answer_key.forbidden_keywords if _normalize_text(kw) in normalized_output
         ]
         if forbidden_hits:
             failure_reason = f"forbidden keywords in output: {forbidden_hits}"
@@ -288,6 +332,52 @@ def score_result(
             if not evidence.get(state_key):
                 failure_reason = f"required evidence not gathered: {source_key!r}"
                 break
+
+    # 5. Primary evidence + explicit sequence check — only for scenarios that
+    # explicitly require the failover event timeline wording.
+    failover_required_tokens = {
+        "primary evidence source",
+        "failover initiated",
+        "failover in progress",
+        "failover completed",
+        "instance available",
+    }
+    normalized_required_keywords = {
+        _normalize_text(keyword) for keyword in answer_key.required_keywords
+    }
+    requires_failover_event_reasoning = failover_required_tokens.issubset(
+        normalized_required_keywords
+    )
+
+    if not failure_reason and requires_failover_event_reasoning:
+        root_cause_text = _normalize_text(root_cause)
+        validated_text = _normalize_text(
+            " ".join(claim.get("claim", "") for claim in final_state.get("validated_claims", []))
+        )
+        causal_chain_text = _normalize_text(" ".join(final_state.get("causal_chain", [])))
+
+        reasoning_text = " ".join([root_cause_text, validated_text, causal_chain_text])
+
+        mentions_event_reasoning = (
+            "rds" in reasoning_text
+            and ("event" in reasoning_text or "timeline" in reasoning_text)
+            and "primary evidence source" in reasoning_text
+        )
+
+        if not mentions_event_reasoning:
+            failure_reason = "RDS events gathered but not used as primary reasoning signal"
+
+        required_sequence_tokens = (
+            "failover initiated",
+            "failover in progress",
+            "failover completed",
+            "instance available",
+        )
+
+        sequence_present = all(token in reasoning_text for token in required_sequence_tokens)
+
+        if not failure_reason and not sequence_present:
+            failure_reason = "RDS event sequence not explicitly listed in required form"
 
     passed = not failure_reason
     trajectory = score_trajectory(fixture, final_state)
@@ -356,12 +446,18 @@ def _print_gap_report(
     gap = ax1_pct - ax2_pct
 
     print("\n=== Axis 1 vs Axis 2 Gap Report ===")
-    print(f"  Axis 1 (all scenarios, full data):  {ax1_pct:.0f}%  ({sum(r.passed for r in axis1_results)}/{len(axis1_results)})")
-    print(f"  Axis 2 (adversarial, selective):    {ax2_pct:.0f}%  ({sum(r.passed for r in axis2_results)}/{len(axis2_results)})")
+    print(
+        f"  Axis 1 (all scenarios, full data):  {ax1_pct:.0f}%  ({sum(r.passed for r in axis1_results)}/{len(axis1_results)})"
+    )
+    print(
+        f"  Axis 2 (adversarial, selective):    {ax2_pct:.0f}%  ({sum(r.passed for r in axis2_results)}/{len(axis2_results)})"
+    )
     print(f"  Gap:                                {gap:+.0f}pp")
 
     print("\n  Per difficulty level:")
-    for level in sorted({difficulty_map.get(r.scenario_id, 0) for r in axis1_results + axis2_results}):
+    for level in sorted(
+        {difficulty_map.get(r.scenario_id, 0) for r in axis1_results + axis2_results}
+    ):
         ax1_level = [r for r in axis1_results if difficulty_map.get(r.scenario_id, 0) == level]
         ax2_level = [r for r in axis2_results if difficulty_map.get(r.scenario_id, 0) == level]
         ax1_pct_l = _pass_rate(ax1_level)
@@ -391,7 +487,11 @@ def run_suite(argv: list[str] | None = None) -> list[ScenarioScore]:
     else:
         for result in results:
             status = "PASS" if result.passed else "FAIL"
-            detail = f"reason={result.failure_reason!r}" if result.failure_reason else f"category={result.actual_category}"
+            detail = (
+                f"reason={result.failure_reason!r}"
+                if result.failure_reason
+                else f"category={result.actual_category}"
+            )
             print(f"{status} {result.scenario_id} {detail}")
 
         passed_count = sum(1 for result in results if result.passed)

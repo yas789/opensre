@@ -5,13 +5,16 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Literal, cast
+from urllib.parse import urlparse
 
 import questionary
 from rich.console import Console
 from rich.text import Text
 
-from app.cli.wizard.config import PROVIDER_BY_VALUE, SUPPORTED_PROVIDERS
+from app.cli.wizard.config import PROVIDER_BY_VALUE, SUPPORTED_PROVIDERS, ProviderOption
 from app.cli.wizard.env_sync import sync_env_values, sync_provider_env
+from app.cli.wizard.integration_health import IntegrationHealthResult
 from app.cli.wizard.probes import ProbeResult, probe_local_target, probe_remote_target
 from app.cli.wizard.prompts import select as select_prompt
 from app.cli.wizard.store import get_store_path, load_local_config, save_local_config
@@ -21,6 +24,10 @@ from app.llm_credentials import has_llm_api_key, save_llm_api_key
 _console = Console()
 DEFAULT_GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 DEFAULT_GITHUB_MCP_MODE = "streamable-http"
+DEFAULT_OPENCLAW_MCP_URL = "http://127.0.0.1:18789/"
+DEFAULT_OPENCLAW_MCP_MODE = "stdio"
+DEFAULT_OPENCLAW_MCP_COMMAND = "openclaw"
+DEFAULT_OPENCLAW_MCP_ARGS = ("mcp", "serve")
 DEFAULT_SENTRY_URL = "https://sentry.io"
 DEFAULT_GITLAB_BASE_URL = "https://gitlab.com/api/v4"
 _ASCII_HEADER = """\
@@ -90,10 +97,25 @@ def validate_sentry_integration(**kwargs):
 
     return _validate(**kwargs)
 
+
+def _looks_like_openclaw_control_ui_url(value: object) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    host = (parsed.hostname or "").strip().lower()
+    if host not in {"127.0.0.1", "localhost", "0.0.0.0"}:
+        return False
+
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+
+    return port == 18789 and parsed.path.rstrip("/") == ""
+
+
 def validate_notion_integration(**kwargs):
     from app.cli.wizard.integration_health import validate_notion_integration as _validate
 
     return _validate(**kwargs)
+
 
 def validate_jira_integration(**kwargs):
     from app.cli.wizard.integration_health import validate_jira_integration as _validate
@@ -113,8 +135,32 @@ def validate_vercel_integration(**kwargs):
     return _validate(**kwargs)
 
 
+def validate_betterstack_integration(**kwargs):
+    from app.cli.wizard.integration_health import validate_betterstack_integration as _validate
+
+    return _validate(**kwargs)
+
+
+def validate_alertmanager_integration(**kwargs):
+    from app.cli.wizard.integration_health import validate_alertmanager_integration as _validate
+
+    return _validate(**kwargs)
+
+
 def validate_opsgenie_integration(**kwargs):
     from app.cli.wizard.integration_health import validate_opsgenie_integration as _validate
+
+    return _validate(**kwargs)
+
+
+def validate_discord_bot(**kwargs):
+    from app.cli.wizard.integration_health import validate_discord_bot as _validate
+
+    return _validate(**kwargs)
+
+
+def validate_openclaw_integration(**kwargs):
+    from app.cli.wizard.integration_health import validate_openclaw_integration as _validate
 
     return _validate(**kwargs)
 
@@ -123,12 +169,6 @@ def get_sentry_auth_recommendations():
     from app.integrations.sentry import get_sentry_auth_recommendations as _get
 
     return _get()
-
-
-@dataclass(frozen=True)
-class IntegrationHealthResult:
-    ok: bool
-    detail: str
 
 
 _STYLE = questionary.Style(
@@ -181,12 +221,13 @@ def _local_defaults() -> dict[str, str | bool | None]:
     raw_provider = local.get("provider")
     provider = PROVIDER_BY_VALUE.get(_string_value(raw_provider)) if raw_provider else None
     api_key_env = _string_value(local.get("api_key_env"), provider.api_key_env if provider else "")
+    is_cli = bool(provider and provider.credential_kind == "cli")
     return {
         "wizard_mode": _string_value(wizard.get("mode"), "quickstart"),
         "provider": _string_value(raw_provider) if raw_provider else None,
         "model": _string_value(local.get("model")),
         "api_key_env": api_key_env,
-        "has_api_key": bool(api_key_env and has_llm_api_key(api_key_env)),
+        "has_api_key": True if is_cli else bool(api_key_env and has_llm_api_key(api_key_env)),
         "legacy_api_key": _string_value(local.get("api_key")),
     }
 
@@ -347,6 +388,7 @@ def _render_saved_summary(
     saved_path: str,
     env_path: str,
     configured_integrations: list[str],
+    credential_line: str = "system keychain",
 ) -> None:
     from app.integrations.store import STORE_PATH
 
@@ -357,17 +399,40 @@ def _render_saved_summary(
     _console.print(f"[dim]services      {integrations}[/]")
     _console.print(f"[dim]config        {saved_path}[/]")
     _console.print(f"[dim]env           {env_path}[/]")
-    _console.print("[dim]llm secret    system keychain[/]")
+    _console.print(f"[dim]llm creds     {credential_line}[/]")
     _console.print(f"[dim]integrations  {STORE_PATH}[/]")
 
 
-def _render_integration_result(service_label: str, result: IntegrationHealthResult) -> None:
+def _render_integration_result(
+    service_label: str,
+    result: IntegrationHealthResult,
+    *,
+    github_display_level: str | None = None,
+) -> None:
+    if result.github_mcp is not None:
+        from app.integrations.github_mcp import (
+            GitHubMcpDisplayDetailLevel,
+            print_github_mcp_validation_report,
+        )
+
+        print_github_mcp_validation_report(
+            result.github_mcp,
+            console=_console,
+            detail_level=cast(
+                GitHubMcpDisplayDetailLevel,
+                github_display_level or "standard",
+            ),
+        )
+        return
     ok = bool(result.ok)
     detail = str(result.detail)
     color = "green" if ok else "red"
     prefix = "Connected" if ok else "Failed"
     _console.print(f"[{color}]{service_label} · {prefix}[/]")
-    _console.print(f"[dim]{detail}[/]")
+    for raw_line in detail.splitlines():
+        line = raw_line.strip()
+        if line:
+            _console.print(f"[dim]{line}[/]")
 
 
 def _configure_grafana() -> tuple[str, str]:
@@ -710,7 +775,7 @@ def _configure_github_mcp() -> tuple[str, str]:
                 default=_joined_values(
                     credentials.get("args"),
                     separator=" ",
-                    fallback="stdio --toolsets repos,issues,pull_requests,actions",
+                    fallback="stdio --toolsets repos,issues,pull_requests,actions,search",
                 ),
             )
             args = [part for part in args_raw.split() if part]
@@ -726,7 +791,7 @@ def _configure_github_mcp() -> tuple[str, str]:
                 default=_joined_values(
                     credentials.get("toolsets"),
                     separator=",",
-                    fallback="repos,issues,pull_requests,actions",
+                    fallback="repos,issues,pull_requests,actions,search",
                 ),
             )
         )
@@ -737,6 +802,26 @@ def _configure_github_mcp() -> tuple[str, str]:
             allow_empty=True,
         )
 
+        repo_view = _choose(
+            "Which repository view should we use to verify access?",
+            [
+                Choice(value="auto", label="Auto (recommended)"),
+                Choice(value="user", label="Your repositories"),
+                Choice(value="starred", label="Starred repositories"),
+                Choice(value="search_user", label="Search: user:<your_login>"),
+            ],
+            default="auto",
+        )
+        repo_visibility = _choose(
+            "Filter repositories by visibility (best-effort)",
+            [
+                Choice(value="any", label="Any (recommended)"),
+                Choice(value="public", label="Public only"),
+                Choice(value="private", label="Private only"),
+            ],
+            default="any",
+        )
+
         with _console.status("Validating GitHub MCP integration...", spinner="dots"):
             result = validate_github_mcp_integration(
                 url=url,
@@ -745,8 +830,31 @@ def _configure_github_mcp() -> tuple[str, str]:
                 command=command,
                 args=args,
                 toolsets=toolsets,
+                repo_view=repo_view,
+                repo_visibility=repo_visibility,
             )
-        _render_integration_result("GitHub MCP", result)
+        display_level = "standard"
+        if result.ok:
+            display_level = _choose(
+                "How should we show repository access?",
+                [
+                    Choice(value="summary", label="Brief (recommended) — no repo names"),
+                    Choice(
+                        value="standard",
+                        label="Standard — scope summary only",
+                    ),
+                    Choice(
+                        value="full",
+                        label="Expanded — include repo names",
+                    ),
+                ],
+                default="summary",
+            )
+        _render_integration_result(
+            "GitHub MCP",
+            result,
+            github_display_level=display_level,
+        )
         if result.ok:
             credentials = {
                 "url": url,
@@ -770,6 +878,111 @@ def _configure_github_mcp() -> tuple[str, str]:
         _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
 
 
+def _configure_openclaw() -> tuple[str, str]:
+    _, credentials = _integration_defaults("openclaw")
+    stored_command = _string_value(credentials.get("command"))
+    stored_args = credentials.get("args")
+    use_stdio_defaults = _looks_like_openclaw_control_ui_url(credentials.get("url")) or (
+        stored_command == "openclaw-mcp"
+        and not _joined_values(stored_args, separator=" ", fallback="")
+    )
+    default_mode = (
+        DEFAULT_OPENCLAW_MCP_MODE
+        if use_stdio_defaults
+        else _string_value(credentials.get("mode"), DEFAULT_OPENCLAW_MCP_MODE)
+    )
+
+    while True:
+        mode = _choose(
+            "Choose the OpenClaw MCP transport:",
+            [
+                Choice(value="stdio", label="stdio (recommended)"),
+                Choice(value="streamable-http", label="Streamable HTTP"),
+                Choice(value="sse", label="SSE"),
+            ],
+            default=default_mode,
+        )
+
+        url = ""
+        command = ""
+        args: list[str] = []
+        auth_token = ""
+        if mode == "stdio":
+            command = _prompt_value(
+                "OpenClaw MCP command",
+                default=(
+                    DEFAULT_OPENCLAW_MCP_COMMAND
+                    if use_stdio_defaults
+                    else _string_value(credentials.get("command"), DEFAULT_OPENCLAW_MCP_COMMAND)
+                ),
+            )
+            args_raw = _prompt_value(
+                "OpenClaw MCP args",
+                default=(
+                    " ".join(DEFAULT_OPENCLAW_MCP_ARGS)
+                    if use_stdio_defaults
+                    else _joined_values(
+                        credentials.get("args"),
+                        separator=" ",
+                        fallback=" ".join(DEFAULT_OPENCLAW_MCP_ARGS),
+                    )
+                ),
+                allow_empty=True,
+            )
+            args = [part for part in args_raw.split() if part]
+        else:
+            url = _prompt_value(
+                "OpenClaw MCP URL",
+                default=_string_value(credentials.get("url"), DEFAULT_OPENCLAW_MCP_URL),
+            )
+            auth_token = _prompt_value(
+                "OpenClaw auth token (optional)",
+                default=_string_value(credentials.get("auth_token")),
+                secret=True,
+                allow_empty=True,
+            )
+
+        credentials = {
+            **credentials,
+            "url": url,
+            "mode": mode,
+            "auth_token": auth_token,
+            "command": command,
+            "args": args,
+        }
+
+        with _console.status("Validating OpenClaw MCP integration...", spinner="dots"):
+            result = validate_openclaw_integration(
+                url=url,
+                mode=mode,
+                auth_token=auth_token,
+                command=command,
+                args=args,
+            )
+        _render_integration_result("OpenClaw", result)
+        if result.ok:
+            credentials_dict = {
+                "url": url,
+                "mode": mode,
+                "auth_token": auth_token,
+                "command": command,
+                "args": args,
+            }
+            upsert_integration("openclaw", {"credentials": credentials_dict})
+            env_path = sync_env_values(
+                {
+                    "OPENCLAW_MCP_URL": url,
+                    "OPENCLAW_MCP_MODE": mode,
+                    "OPENCLAW_MCP_AUTH_TOKEN": auth_token,
+                    "OPENCLAW_MCP_COMMAND": command,
+                    "OPENCLAW_MCP_ARGS": " ".join(args),
+                }
+            )
+            return "OpenClaw", str(env_path)
+        default_mode = mode
+        _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
+
+
 def _configure_gitlab() -> tuple[str, str]:
     _, credentials = _integration_defaults("gitlab")
 
@@ -790,7 +1003,12 @@ def _configure_gitlab() -> tuple[str, str]:
         if result.ok:
             credentials = {"base_url": base_url, "auth_token": auth_token}
             upsert_integration("gitlab", {"credentials": credentials})
-            env_path = sync_env_values({"GITLAB_BASE_URL": base_url})
+            env_path = sync_env_values(
+                {
+                    "GITLAB_BASE_URL": base_url,
+                    "GITLAB_ACCESS_TOKEN": auth_token,
+                }
+            )
             return "Gitlab", str(env_path)
         _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
 
@@ -850,6 +1068,7 @@ def _configure_sentry() -> tuple[str, str]:
             return "Sentry", str(env_path)
         _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
 
+
 def _configure_notion() -> tuple[str, str]:
     _, credentials = _integration_defaults("notion")
     _console.print("\n[bold]Notion Integration[/bold]")
@@ -865,10 +1084,13 @@ def _configure_notion() -> tuple[str, str]:
         _render_integration_result("Notion", result)
 
         if result.ok:
-            upsert_integration("notion", {"credentials": {"api_key": api_key, "database_id": database_id}})
+            upsert_integration(
+                "notion", {"credentials": {"api_key": api_key, "database_id": database_id}}
+            )
             env_path = sync_env_values({"NOTION_DATABASE_ID": database_id})
             return "Notion", str(env_path)
         _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
+
 
 def _configure_jira() -> tuple[str, str]:
     _, credentials = _integration_defaults("jira")
@@ -972,6 +1194,102 @@ def _configure_vercel() -> tuple[str, str]:
         _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
 
 
+def _configure_betterstack() -> tuple[str, str]:
+    _, credentials = _integration_defaults("betterstack")
+    while True:
+        query_endpoint = _prompt_value(
+            "Better Stack SQL query endpoint (e.g. https://eu-nbg-2-connect.betterstackdata.com)",
+            default=_string_value(credentials.get("query_endpoint")),
+        )
+        username = _prompt_value(
+            "Better Stack username (Integrations > Connect ClickHouse HTTP client)",
+            default=_string_value(credentials.get("username")),
+        )
+        password = _prompt_value(
+            "Better Stack password",
+            default=_string_value(credentials.get("password")),
+            secret=True,
+        )
+        sources_raw = _prompt_value(
+            "Better Stack sources (comma-separated base IDs from dashboard, e.g. t123456_myapp; optional planner hint)",
+            default=_joined_values(credentials.get("sources"), separator=",", fallback=""),
+            allow_empty=True,
+        )
+        sources = [part.strip() for part in sources_raw.split(",") if part.strip()]
+
+        with _console.status("Validating Better Stack integration...", spinner="dots"):
+            result = validate_betterstack_integration(
+                query_endpoint=query_endpoint,
+                username=username,
+                password=password,
+                sources=sources,
+            )
+        _render_integration_result("Better Stack", result)
+        if result.ok:
+            upsert_integration(
+                "betterstack",
+                {
+                    "credentials": {
+                        "query_endpoint": query_endpoint,
+                        "username": username,
+                        "password": password,
+                        "sources": sources,
+                    }
+                },
+            )
+            env_path = sync_env_values({})
+            return "Better Stack", str(env_path)
+        _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
+
+
+def _configure_alertmanager() -> tuple[str, str]:
+    _, credentials = _integration_defaults("alertmanager")
+    while True:
+        base_url = _prompt_value(
+            "Alertmanager URL (e.g. http://alertmanager:9093)",
+            default=_string_value(credentials.get("base_url")),
+        )
+        if not base_url:
+            _console.print("[red]Alertmanager URL is required.[/]")
+            continue
+        auth_choice = _choose(
+            "Authentication method",
+            [
+                Choice(value="none", label="None (unauthenticated / internal network)"),
+                Choice(value="bearer", label="Bearer token (reverse proxy auth)"),
+                Choice(value="basic", label="Basic auth (username + password)"),
+            ],
+            default="none",
+        )
+        bearer_token = ""
+        username = ""
+        password = ""
+        if auth_choice == "bearer":
+            bearer_token = _prompt_value("Bearer token", secret=True)
+        elif auth_choice == "basic":
+            username = _prompt_value("Username")
+            password = _prompt_value("Password", secret=True)
+        with _console.status("Validating Alertmanager integration...", spinner="dots"):
+            result = validate_alertmanager_integration(
+                base_url=base_url,
+                bearer_token=bearer_token,
+                username=username,
+                password=password,
+            )
+        _render_integration_result("Alertmanager", result)
+        if result.ok:
+            creds: dict[str, str] = {"base_url": base_url}
+            if bearer_token:
+                creds["bearer_token"] = bearer_token
+            if username:
+                creds["username"] = username
+                creds["password"] = password
+            upsert_integration("alertmanager", {"credentials": creds})
+            env_path = sync_env_values({})
+            return "Alertmanager", str(env_path)
+        _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
+
+
 def _configure_opsgenie() -> tuple[str, str]:
     _, credentials = _integration_defaults("opsgenie")
     while True:
@@ -997,6 +1315,61 @@ def _configure_opsgenie() -> tuple[str, str]:
         _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
 
 
+def _configure_discord() -> tuple[str, str]:
+    _, credentials = _integration_defaults("discord")
+    _console.print(
+        "\n[bold]Discord Integration[/bold]\n"
+        "[dim]Get your credentials from https://discord.com/developers/applications.[/]\n"
+    )
+    while True:
+        bot_token = _prompt_value(
+            "Discord bot token",
+            default=_string_value(credentials.get("bot_token")),
+            secret=True,
+        )
+        application_id = _prompt_value(
+            "Discord application ID",
+            default=_string_value(credentials.get("application_id")),
+        )
+        public_key = _prompt_value(
+            "Discord public key (from Developer Portal)",
+            default=_string_value(credentials.get("public_key")),
+        )
+        default_channel_id = _prompt_value(
+            "Default channel ID (optional)",
+            default=_string_value(credentials.get("default_channel_id")),
+            allow_empty=True,
+        )
+        with _console.status("Validating Discord bot token...", spinner="dots"):
+            result = validate_discord_bot(bot_token=bot_token)
+        _render_integration_result("Discord", result)
+        if result.ok:
+            upsert_integration(
+                "discord",
+                {
+                    "credentials": {
+                        "bot_token": bot_token,
+                        "application_id": application_id,
+                        "public_key": public_key,
+                        "default_channel_id": default_channel_id,
+                    }
+                },
+            )
+            from app.integrations.cli import _register_discord_slash_command
+
+            _register_discord_slash_command(application_id, bot_token)
+            env_path = sync_env_values(
+                {
+                    "DISCORD_BOT_TOKEN": bot_token,
+                    "DISCORD_APPLICATION_ID": application_id,
+                    "DISCORD_PUBLIC_KEY": public_key,
+                    "DISCORD_DEFAULT_CHANNEL_ID": default_channel_id,
+                }
+            )
+            return "Discord", str(env_path)
+        _console.print("[dim]Try again or press Ctrl+C to cancel.[/]")
+
+
 def _configure_selected_integrations() -> tuple[list[str], str | None]:
     configured: list[str] = []
     last_env_path: str | None = None
@@ -1019,6 +1392,11 @@ def _configure_selected_integrations() -> tuple[list[str], str | None]:
         Choice(value="honeycomb", label="Honeycomb", hint="Query traces and spans from Honeycomb"),
         Choice(value="coralogix", label="Coralogix", hint="Query logs from Coralogix DataPrime"),
         Choice(value="slack", label="Slack", hint="Send findings to a webhook or channel"),
+        Choice(
+            value="discord",
+            label="Discord",
+            hint="Trigger investigations via slash commands and post findings to threads",
+        ),
         Choice(value="aws", label="AWS", hint="Inspect CloudWatch, EKS, and account resources"),
         Choice(
             value="github", label="GitHub MCP", hint="Let the agent inspect repos, PRs, and issues"
@@ -1040,9 +1418,19 @@ def _configure_selected_integrations() -> tuple[list[str], str | None]:
             ),
         ),
         Choice(
+            value="betterstack",
+            label="Better Stack Telemetry",
+            hint="Query logs from Better Stack (ClickHouse SQL over HTTP)",
+        ),
+        Choice(
             value="jira",
             label="Jira",
             hint="File and update incident tickets automatically",
+        ),
+        Choice(
+            value="alertmanager",
+            label="Alertmanager",
+            hint="Query firing alerts and silences from Prometheus Alertmanager",
         ),
         Choice(
             value="opsgenie",
@@ -1053,6 +1441,11 @@ def _configure_selected_integrations() -> tuple[list[str], str | None]:
             value="notion",
             label="Notion",
             hint="Post investigation reports to a Notion database",
+        ),
+        Choice(
+            value="openclaw",
+            label="OpenClaw",
+            hint="Connect OpenSRE to OpenClaw so your AI coding assistant can trigger investigations",
         ),
         Choice(
             value="skip",
@@ -1075,15 +1468,19 @@ def _configure_selected_integrations() -> tuple[list[str], str | None]:
         "honeycomb": _configure_honeycomb,
         "coralogix": _configure_coralogix,
         "slack": _configure_slack,
+        "discord": _configure_discord,
         "aws": _configure_aws,
         "github": _configure_github_mcp,
         "sentry": _configure_sentry,
         "gitlab": _configure_gitlab,
         "google_docs": _configure_google_docs,
         "vercel": _configure_vercel,
+        "betterstack": _configure_betterstack,
         "jira": _configure_jira,
+        "alertmanager": _configure_alertmanager,
         "opsgenie": _configure_opsgenie,
         "notion": _configure_notion,
+        "openclaw": _configure_openclaw,
     }
     _SERVICE_LABELS = {
         "grafana_local": "grafana local",
@@ -1092,6 +1489,7 @@ def _configure_selected_integrations() -> tuple[list[str], str | None]:
         "honeycomb": "honeycomb",
         "coralogix": "coralogix",
         "slack": "slack",
+        "discord": "discord",
         "aws": "aws",
         "github": "github mcp",
         "sentry": "sentry",
@@ -1099,8 +1497,10 @@ def _configure_selected_integrations() -> tuple[list[str], str | None]:
         "google_docs": "google docs",
         "vercel": "vercel",
         "jira": "jira",
+        "alertmanager": "alertmanager",
         "opsgenie": "opsgenie",
         "notion": "notion",
+        "openclaw": "openclaw",
     }
 
     _step(f"Service · {_SERVICE_LABELS.get(selected_service, selected_service)}")
@@ -1145,6 +1545,80 @@ def _render_next_steps() -> None:
     _console.print(
         "[dim]opensre investigate -i tests/e2e/kubernetes/fixtures/datadog_k8s_alert.json[/]"
     )
+
+
+def _run_cli_llm_onboarding(provider: ProviderOption) -> Literal["ok", "abort", "repick"]:
+    """Probe CLI binary + auth; recovery menu when missing. ``repick`` = choose another LLM."""
+    factory = provider.adapter_factory
+    if factory is None:
+        _console.print("[red]Internal error: CLI provider missing adapter factory.[/]")
+        return "abort"
+    adapter = factory()
+    env_key = adapter.binary_env_key
+    install_hint = adapter.install_hint
+    auth_hint = adapter.auth_hint
+    name = adapter.name
+    for _attempt in range(10):
+        probe = adapter.detect()
+        if probe.installed and probe.logged_in is True:
+            _console.print(f"[dim]{probe.detail}[/]")
+            return "ok"
+        if probe.installed and probe.logged_in is not True:
+            _console.print(f"[yellow]{probe.detail}[/]")
+            status_prompt = (
+                f"{provider.label} requires login. What next?"
+                if probe.logged_in is False
+                else f"Could not verify {provider.label} login. What next?"
+            )
+            action = _choose(
+                status_prompt,
+                [
+                    Choice(
+                        value="retry",
+                        label="Re-detect after logging in",
+                        hint=auth_hint,
+                    ),
+                    Choice(
+                        value="repick",
+                        label="Pick a different LLM provider",
+                        hint=None,
+                    ),
+                ],
+                default="retry",
+            )
+            if action == "repick":
+                return "repick"
+            continue
+        action = _choose(
+            f"{provider.label} not found. What next?",
+            [
+                Choice(
+                    value="retry",
+                    label="Re-detect after install",
+                    hint=install_hint,
+                ),
+                Choice(
+                    value="path",
+                    label="Enter full path to the binary",
+                    hint=f"Writes {env_key} to .env",
+                ),
+                Choice(
+                    value="repick",
+                    label="Pick a different LLM provider",
+                    hint=None,
+                ),
+            ],
+            default="retry",
+        )
+        if action == "repick":
+            return "repick"
+        if action == "path":
+            path = _prompt_value(f"Full path to {name} binary")
+            sync_env_values({env_key: path})
+            continue
+        _console.print(f"[dim]Hint: {install_hint}[/]")
+    _console.print("[yellow]Too many retry attempts. Aborting setup.[/]")
+    return "abort"
 
 
 def run_wizard(_argv: list[str] | None = None) -> int:
@@ -1198,64 +1672,84 @@ def run_wizard(_argv: list[str] | None = None) -> int:
         print("Only local configuration is supported today.", file=sys.stderr)
         return 1
 
-    _step("LLM Provider")
-    saved_provider = PROVIDER_BY_VALUE.get(saved_provider_value) if saved_provider_value else None
-    if saved_provider is not None:
-        current_model = saved_model_value or saved_provider.default_model
-        _console.print(f"[dim]current provider  {saved_provider.label}  ·  {current_model}[/]")
-        change_provider = _confirm("Change provider?", default=False)
-    else:
-        change_provider = True
+    force_repick = False
+    provider: ProviderOption
+    model: str
+    while True:
+        _step("LLM Provider")
+        saved_provider = (
+            PROVIDER_BY_VALUE.get(saved_provider_value) if saved_provider_value else None
+        )
+        if saved_provider is not None and not force_repick:
+            current_model = saved_model_value or saved_provider.default_model
+            _console.print(f"[dim]current provider  {saved_provider.label}  ·  {current_model}[/]")
+            change_provider = _confirm("Change provider?", default=False)
+        else:
+            change_provider = True
+        force_repick = False
 
-    if change_provider:
-        provider = PROVIDER_BY_VALUE[
-            _choose(
-                "Choose your LLM provider",
-                [
-                    Choice(
-                        value=p.value,
-                        label=p.label,
-                        hint=p.group,
-                    )
-                    for p in SUPPORTED_PROVIDERS
-                ],
-                default=default_provider_value,
-            )
-        ]
-        model = provider.default_model
-        _step("API Key")
-        try:
-            api_key = _prompt_value(
-                f"{provider.label} API key ({provider.api_key_env})",
-                secret=True,
-            )
-        except KeyboardInterrupt:
-            _console.print("\n[yellow]Setup cancelled.[/]")
-            return 1
-        if not _persist_llm_api_key(provider.api_key_env, api_key):
-            return 1
-    else:
-        assert saved_provider is not None
-        provider = saved_provider
-        model = saved_model_value or provider.default_model
-        has_api_key = bool(defaults["has_api_key"])
-        legacy_api_key = str(defaults["legacy_api_key"] or "").strip()
-        if not has_api_key and legacy_api_key:
-            if not _persist_llm_api_key(provider.api_key_env, legacy_api_key):
-                return 1
-            has_api_key = True
-        if not has_api_key:
-            _step("API Key")
-            try:
-                api_key = _prompt_value(
-                    f"{provider.label} API key ({provider.api_key_env})",
-                    secret=True,
+        if change_provider:
+            provider = PROVIDER_BY_VALUE[
+                _choose(
+                    "Choose your LLM provider",
+                    [
+                        Choice(
+                            value=p.value,
+                            label=p.label,
+                            hint=p.group,
+                        )
+                        for p in SUPPORTED_PROVIDERS
+                    ],
+                    default=default_provider_value,
                 )
-            except KeyboardInterrupt:
-                _console.print("\n[yellow]Setup cancelled.[/]")
+            ]
+            model = provider.default_model
+            if provider.credential_kind != "cli":
+                _step(provider.credential_label.title())
+                try:
+                    api_key = _prompt_value(
+                        f"{provider.label} {provider.credential_label} ({provider.api_key_env})",
+                        default=provider.credential_default,
+                        secret=provider.credential_secret,
+                    )
+                except KeyboardInterrupt:
+                    _console.print("\n[yellow]Setup cancelled.[/]")
+                    return 1
+                if not _persist_llm_api_key(provider.api_key_env, api_key):
+                    return 1
+        else:
+            assert saved_provider is not None
+            provider = saved_provider
+            model = saved_model_value or provider.default_model
+            if provider.credential_kind != "cli":
+                has_api_key = bool(defaults["has_api_key"])
+                legacy_api_key = str(defaults["legacy_api_key"] or "").strip()
+                if not has_api_key and legacy_api_key:
+                    if not _persist_llm_api_key(provider.api_key_env, legacy_api_key):
+                        return 1
+                    has_api_key = True
+                if not has_api_key:
+                    _step(provider.credential_label.title())
+                    try:
+                        api_key = _prompt_value(
+                            f"{provider.label} {provider.credential_label} ({provider.api_key_env})",
+                            default=provider.credential_default,
+                            secret=provider.credential_secret,
+                        )
+                    except KeyboardInterrupt:
+                        _console.print("\n[yellow]Setup cancelled.[/]")
+                        return 1
+                    if not _persist_llm_api_key(provider.api_key_env, api_key):
+                        return 1
+
+        if provider.credential_kind == "cli":
+            cli_out = _run_cli_llm_onboarding(provider)
+            if cli_out == "abort":
                 return 1
-            if not _persist_llm_api_key(provider.api_key_env, api_key):
-                return 1
+            if cli_out == "repick":
+                force_repick = True
+                continue
+        break
 
     probes = {
         "local": local_probe.as_dict(),
@@ -1287,6 +1781,11 @@ def run_wizard(_argv: list[str] | None = None) -> int:
         saved_path=str(saved_path),
         env_path=summary_env_path,
         configured_integrations=configured_integrations,
+        credential_line=(
+            "OpenAI Codex CLI (`codex login`)"
+            if provider.credential_kind == "cli"
+            else "system keychain"
+        ),
     )
     demo_response = build_demo_action_response()
     _render_demo_response(demo_response)

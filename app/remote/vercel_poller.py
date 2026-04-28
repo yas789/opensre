@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from app.integrations.verify import resolve_effective_integrations
@@ -375,7 +375,9 @@ def _parallel_deployment_events_and_runtime_logs(
     def _events() -> list[dict[str, Any]]:
         with _make_client_from_config(config) as worker:
             result = worker.get_deployment_events(deployment_id, limit=log_limit)
-            return result.get("events", []) if result.get("success") else []
+            if not result.get("success"):
+                return []
+            return cast(list[dict[str, Any]], result.get("events", []))
 
     def _runtime() -> list[dict[str, Any]]:
         with _make_client_from_config(config) as worker:
@@ -384,7 +386,9 @@ def _parallel_deployment_events_and_runtime_logs(
                 limit=log_limit,
                 project_id=project_id,
             )
-            return result.get("logs", []) if result.get("success") else []
+            if not result.get("success"):
+                return []
+            return cast(list[dict[str, Any]], result.get("logs", []))
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         events_future = pool.submit(_events)
@@ -429,9 +433,7 @@ def _fetch_deployment_bundle(
         limit=log_limit,
         project_id=project_id,
     )
-    runtime_logs = (
-        runtime_logs_result.get("logs", []) if runtime_logs_result.get("success") else []
-    )
+    runtime_logs = runtime_logs_result.get("logs", []) if runtime_logs_result.get("success") else []
     return deployment, events, runtime_logs
 
 
@@ -481,8 +483,7 @@ def _select_latest_actionable_deployment(
     deployments_result = client.list_deployments(project_id=project_id, limit=deployment_limit)
     if not deployments_result.get("success"):
         raise VercelResolutionError(
-            "Failed to list Vercel deployments: "
-            f"{deployments_result.get('error', 'unknown error')}"
+            f"Failed to list Vercel deployments: {deployments_result.get('error', 'unknown error')}"
         )
 
     for deployment in deployments_result.get("deployments", []):
@@ -498,7 +499,9 @@ def _select_latest_actionable_deployment(
         if _deployment_is_actionable(deployment_details, events, runtime_logs):
             return deployment_details, events, runtime_logs
 
-    raise VercelResolutionError("No actionable Vercel deployments were found for the target project.")
+    raise VercelResolutionError(
+        "No actionable Vercel deployments were found for the target project."
+    )
 
 
 def _deployment_is_actionable(
@@ -871,7 +874,9 @@ def collect_vercel_candidates(
     if config is None:
         if fail_on_error:
             raise VercelResolutionError("Vercel integration is not configured.")
-        logger.warning("Skipping Vercel incident collection because the integration is not configured.")
+        logger.warning(
+            "Skipping Vercel incident collection because the integration is not configured."
+        )
         return []
 
     allowlist = {item.lower() for item in project_allowlist}

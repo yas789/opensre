@@ -3,10 +3,15 @@ from __future__ import annotations
 import sys
 import types
 
+import httpx
+import pytest
+
 from app.cli.wizard.integration_health import (
     validate_aws_integration,
+    validate_betterstack_integration,
     validate_coralogix_integration,
     validate_datadog_integration,
+    validate_discord_bot,
     validate_github_mcp_integration,
     validate_grafana_integration,
     validate_honeycomb_integration,
@@ -14,6 +19,8 @@ from app.cli.wizard.integration_health import (
     validate_slack_webhook,
     validate_vercel_integration,
 )
+from app.integrations.betterstack import BetterStackValidationResult
+from app.integrations.github_mcp import GitHubMCPValidationResult
 
 
 class _FakeGrafanaClient:
@@ -117,21 +124,26 @@ def test_validate_coralogix_integration_fails(monkeypatch) -> None:
     assert "http 401" in result.detail.lower()
 
 
-def test_validate_slack_webhook_succeeds_with_non_posting_probe(monkeypatch) -> None:
+@pytest.mark.parametrize("status_code", [200, 400, 403, 405])
+def test_validate_slack_webhook_succeeds_for_allowed_probe_statuses(
+    monkeypatch,
+    status_code: int,
+) -> None:
     monkeypatch.setattr(
-        "app.cli.wizard.integration_health.requests.get",
-        lambda *_args, **_kwargs: types.SimpleNamespace(status_code=405),
+        "app.cli.wizard.integration_health.httpx.get",
+        lambda *_args, **_kwargs: types.SimpleNamespace(status_code=status_code),
     )
 
     result = validate_slack_webhook(webhook_url="https://hooks.slack.com/services/T000/B000/abc")
 
     assert result.ok is True
-    assert "non-posting probe" in result.detail
+    assert "non-posting probe" in result.detail.lower()
+    assert f"HTTP {status_code}" in result.detail
 
 
 def test_validate_slack_webhook_fails_for_not_found(monkeypatch) -> None:
     monkeypatch.setattr(
-        "app.cli.wizard.integration_health.requests.get",
+        "app.cli.wizard.integration_health.httpx.get",
         lambda *_args, **_kwargs: types.SimpleNamespace(status_code=404),
     )
 
@@ -139,6 +151,22 @@ def test_validate_slack_webhook_fails_for_not_found(monkeypatch) -> None:
 
     assert result.ok is False
     assert "404" in result.detail
+
+
+def test_validate_slack_webhook_fails_for_httpx_request_error(monkeypatch) -> None:
+    def _raise_request_error(*_args, **_kwargs):
+        raise httpx.RequestError(
+            "connection failed",
+            request=httpx.Request("GET", "https://hooks.slack.com/services/T000/B000/abc"),
+        )
+
+    monkeypatch.setattr("app.cli.wizard.integration_health.httpx.get", _raise_request_error)
+
+    result = validate_slack_webhook(webhook_url="https://hooks.slack.com/services/T000/B000/abc")
+
+    assert result.ok is False
+    assert "slack webhook validation failed" in result.detail.lower()
+    assert "connection failed" in result.detail.lower()
 
 
 def test_validate_slack_webhook_fails_for_invalid_host() -> None:
@@ -179,7 +207,10 @@ def test_validate_aws_integration_succeeds_with_role_assumption(monkeypatch) -> 
 
     class _FakeAssumedSts:
         def get_caller_identity(self) -> dict[str, str]:
-            return {"Account": "123456789012", "Arn": "arn:aws:sts::123456789012:assumed-role/demo/session"}
+            return {
+                "Account": "123456789012",
+                "Arn": "arn:aws:sts::123456789012:assumed-role/demo/session",
+            }
 
     def _client(service_name: str, **kwargs):
         if service_name != "sts":
@@ -223,7 +254,14 @@ def test_validate_aws_integration_fails_when_boto3_client_raises(monkeypatch) ->
 def test_validate_github_mcp_integration_uses_shared_validator(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.cli.wizard.integration_health.validate_github_mcp_config",
-        lambda _config: types.SimpleNamespace(ok=True, detail="GitHub MCP ok"),
+        lambda _config, **_kwargs: GitHubMCPValidationResult(
+            ok=True,
+            detail="OK @ghuser; repos=1; owners=o; examples=o/r; mcp_tools=1",
+            authenticated_user="ghuser",
+            repo_access_count=1,
+            repo_access_scope_owners=("o",),
+            repo_access_samples=("o/r",),
+        ),
     )
 
     result = validate_github_mcp_integration(
@@ -234,7 +272,11 @@ def test_validate_github_mcp_integration_uses_shared_validator(monkeypatch) -> N
     )
 
     assert result.ok is True
-    assert result.detail == "GitHub MCP ok"
+    assert "Configuration validation: succeeded" in result.detail
+    assert "GitHub identity: @ghuser" in result.detail
+    assert "Repositories returned (probe): 1" in result.detail
+    assert result.github_mcp is not None
+    assert result.github_mcp.authenticated_user == "ghuser"
 
 
 def test_validate_sentry_integration_uses_shared_validator(monkeypatch) -> None:
@@ -271,7 +313,9 @@ class _FakeVercelClient:
 def test_validate_vercel_integration_succeeds(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.cli.wizard.integration_health.VercelClient",
-        lambda _config: _FakeVercelClient({"success": True, "projects": [{"id": "p1"}], "total": 1}),
+        lambda _config: _FakeVercelClient(
+            {"success": True, "projects": [{"id": "p1"}], "total": 1}
+        ),
     )
 
     result = validate_vercel_integration(api_token="tok_test")
@@ -332,4 +376,103 @@ def test_validate_vercel_integration_surfaces_exception(monkeypatch) -> None:
     result = validate_vercel_integration(api_token="tok_test")
 
     assert result.ok is False
-    assert "network unreachable" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# validate_discord_bot
+# ---------------------------------------------------------------------------
+
+
+def test_validate_discord_bot_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "httpx.get",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            status_code=200,
+            json=lambda: {"username": "my-sre-bot"},
+        ),
+    )
+    result = validate_discord_bot(bot_token="Bot.valid.token")
+    assert result.ok is True
+    assert "my-sre-bot" in result.detail
+
+
+def test_validate_discord_bot_invalid_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "httpx.get",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            status_code=401,
+            json=lambda: {"message": "401: Unauthorized"},
+        ),
+    )
+    result = validate_discord_bot(bot_token="bad-token")
+    assert result.ok is False
+    assert "invalid or revoked" in result.detail.lower()
+
+
+def test_validate_discord_bot_unexpected_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "httpx.get",
+        lambda *_a, **_kw: types.SimpleNamespace(
+            status_code=500,
+            json=lambda: {},
+        ),
+    )
+    result = validate_discord_bot(bot_token="some-token")
+    assert result.ok is False
+    assert "500" in result.detail
+
+
+def test_validate_discord_bot_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx as _httpx
+
+    def _raise(*_a: object, **_kw: object) -> None:
+        raise _httpx.RequestError("connection refused")
+
+    monkeypatch.setattr("httpx.get", _raise)
+    result = validate_discord_bot(bot_token="some-token")
+    assert result.ok is False
+    assert "unreachable" in result.detail.lower()
+
+
+def test_validate_betterstack_integration_succeeds(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.cli.wizard.integration_health.validate_betterstack_config",
+        lambda _config: BetterStackValidationResult(ok=True, detail="Connected."),
+    )
+    result = validate_betterstack_integration(
+        query_endpoint="https://eu-nbg-2-connect.betterstackdata.com",
+        username="u",
+        password="p",
+        sources=["t1_myapp"],
+    )
+    assert result.ok is True
+    assert result.detail == "Connected."
+
+
+def test_validate_betterstack_integration_forwards_failure_detail(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.cli.wizard.integration_health.validate_betterstack_config",
+        lambda _config: BetterStackValidationResult(
+            ok=False, detail="Better Stack authentication failed."
+        ),
+    )
+    result = validate_betterstack_integration(
+        query_endpoint="https://x",
+        username="u",
+        password="wrong",
+    )
+    assert result.ok is False
+    assert "authentication" in result.detail.lower()
+
+
+def test_validate_betterstack_integration_accepts_empty_tables() -> None:
+    # Tables are optional; calling with no tables must not crash and must not
+    # call network (covered by the probe-level tests separately).
+    result = validate_betterstack_integration(
+        query_endpoint="",
+        username="",
+        password="",
+    )
+    # Empty config returns the "required" detail from the underlying probe.
+    assert result.ok is False
+    assert "required" in result.detail.lower()

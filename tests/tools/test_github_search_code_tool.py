@@ -15,9 +15,10 @@ class TestGitHubSearchCodeToolContract(BaseToolContract):
 
 def test_is_available_requires_connection_verified_owner_repo() -> None:
     rt = search_github_code.__opensre_registered_tool__
-    assert rt.is_available({
-        "github": {"connection_verified": True, "owner": "org", "repo": "repo"}
-    }) is True
+    assert (
+        rt.is_available({"github": {"connection_verified": True, "owner": "org", "repo": "repo"}})
+        is True
+    )
     assert rt.is_available({"github": {"connection_verified": True}}) is False
     assert rt.is_available({}) is False
 
@@ -33,8 +34,12 @@ def test_extract_params_maps_fields() -> None:
 def test_run_returns_unavailable_when_no_config() -> None:
     with patch("app.tools.GitHubSearchCodeTool.github_mcp_config_from_env", return_value=None):
         result = search_github_code(owner="org", repo="repo", query="error")
-    assert result["available"] is False
-    assert result["matches"] is None or result.get("matches") == [] or "error" in result
+    assert result == {
+        "source": "github",
+        "available": False,
+        "error": "GitHub MCP integration is not configured.",
+        "matches": [],
+    }
 
 
 def test_run_happy_path() -> None:
@@ -47,13 +52,20 @@ def test_run_happy_path() -> None:
         "content": [],
     }
     from unittest.mock import MagicMock
+
     mock_config = MagicMock()
-    with patch("app.tools.GitHubSearchCodeTool.github_mcp_config_from_env", return_value=None), \
-         patch("app.tools.GitHubSearchCodeTool.build_github_mcp_config", return_value=mock_config), \
-         patch("app.tools.GitHubSearchCodeTool.call_github_mcp_tool", return_value=fake_result):
+    with (
+        patch("app.tools.GitHubSearchCodeTool.github_mcp_config_from_env", return_value=None),
+        patch("app.tools.GitHubSearchCodeTool.build_github_mcp_config", return_value=mock_config),
+        patch("app.tools.GitHubSearchCodeTool.call_github_mcp_tool", return_value=fake_result),
+    ):
         result = search_github_code(
-            owner="org", repo="repo", query="error",
-            github_url="http://mcp", github_mode="streamable-http", github_token="tok",
+            owner="org",
+            repo="repo",
+            query="error",
+            github_url="http://mcp",
+            github_mode="streamable-http",
+            github_token="tok",
         )
     assert result["available"] is True
     assert result["matches"] == fake_result["structured_content"]
@@ -67,13 +79,20 @@ def test_run_tool_error() -> None:
         "arguments": {},
     }
     from unittest.mock import MagicMock
+
     mock_config = MagicMock()
-    with patch("app.tools.GitHubSearchCodeTool.github_mcp_config_from_env", return_value=None), \
-         patch("app.tools.GitHubSearchCodeTool.build_github_mcp_config", return_value=mock_config), \
-         patch("app.tools.GitHubSearchCodeTool.call_github_mcp_tool", return_value=fake_result):
+    with (
+        patch("app.tools.GitHubSearchCodeTool.github_mcp_config_from_env", return_value=None),
+        patch("app.tools.GitHubSearchCodeTool.build_github_mcp_config", return_value=mock_config),
+        patch("app.tools.GitHubSearchCodeTool.call_github_mcp_tool", return_value=fake_result),
+    ):
         result = search_github_code(
-            owner="org", repo="repo", query="error",
-            github_url="http://mcp", github_mode="streamable-http", github_token="tok",
+            owner="org",
+            repo="repo",
+            query="error",
+            github_url="http://mcp",
+            github_mode="streamable-http",
+            github_token="tok",
         )
     assert result["available"] is False
     assert "rate limited" in result["error"]

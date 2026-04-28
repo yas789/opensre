@@ -52,3 +52,73 @@ def test_detect_sources_includes_coralogix_with_scoped_default_query() -> None:
     assert sources["coralogix"]["application_name"] == "payments"
     assert sources["coralogix"]["subsystem_name"] == "worker"
     assert "$l.applicationname == 'payments'" in sources["coralogix"]["default_query"]
+
+
+def test_detect_sources_includes_openclaw_when_resolved() -> None:
+    sources = detect_sources(
+        raw_alert={"alert_name": "checkout-api failures", "service": "checkout-api"},
+        context={},
+        resolved_integrations={
+            "openclaw": {
+                "mode": "stdio",
+                "command": "openclaw",
+                "args": ["mcp", "serve"],
+                "auth_token": "",
+            }
+        },
+    )
+
+    assert sources["openclaw"]["openclaw_mode"] == "stdio"
+    assert sources["openclaw"]["openclaw_command"] == "openclaw"
+    assert sources["openclaw"]["openclaw_args"] == ["mcp", "serve"]
+    assert sources["openclaw"]["openclaw_search_query"] == "checkout-api"
+
+
+_GITLAB_INTEGRATION = {
+    "gitlab": {
+        "base_url": "https://gitlab.example.com/api/v4",
+        "auth_token": "gl-token",
+    }
+}
+
+_BASE_ALERT = {"gitlab_project": "my-org/my-repo"}
+
+
+def test_detect_sources_gitlab_extracts_mr_iid_from_annotations() -> None:
+    raw_alert = {**_BASE_ALERT, "annotations": {"mr_iid": "42"}}
+
+    sources = detect_sources(raw_alert, {}, resolved_integrations=_GITLAB_INTEGRATION)
+
+    assert sources["gitlab"]["merge_request_iid"] == "42"
+
+
+def test_detect_sources_gitlab_mr_iid_empty_when_not_in_alert() -> None:
+    raw_alert = _BASE_ALERT
+
+    sources = detect_sources(raw_alert, {}, resolved_integrations=_GITLAB_INTEGRATION)
+
+    assert sources["gitlab"]["merge_request_iid"] == ""
+
+
+def test_detect_sources_gitlab_mr_iid_strips_whitespace() -> None:
+    raw_alert = {**_BASE_ALERT, "annotations": {"mr_iid": "  7  "}}
+
+    sources = detect_sources(raw_alert, {}, resolved_integrations=_GITLAB_INTEGRATION)
+
+    assert sources["gitlab"]["merge_request_iid"] == "7"
+
+
+def test_detect_sources_gitlab_not_added_when_no_project_id() -> None:
+    raw_alert = {"annotations": {"mr_iid": "42"}}  # no gitlab_project in alert
+
+    sources = detect_sources(raw_alert, {}, resolved_integrations=_GITLAB_INTEGRATION)
+
+    assert "gitlab" not in sources
+
+
+def test_detect_sources_gitlab_not_added_when_no_integration() -> None:
+    raw_alert = _BASE_ALERT
+
+    sources = detect_sources(raw_alert, {}, resolved_integrations={})
+
+    assert "gitlab" not in sources

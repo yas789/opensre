@@ -83,7 +83,33 @@ def test_run_extension_not_available() -> None:
 
 
 def test_run_error_propagated() -> None:
-    with patch("app.tools.PostgreSQLSlowQueriesTool.get_slow_queries", return_value={"source": "postgresql", "available": False, "error": "database does not exist"}):
+    with patch(
+        "app.tools.PostgreSQLSlowQueriesTool.get_slow_queries",
+        return_value={
+            "source": "postgresql",
+            "available": False,
+            "error": "database does not exist",
+        },
+    ):
         result = get_postgresql_slow_queries(host="localhost", database="invalid_db")
     assert "error" in result
     assert result["available"] is False
+
+
+def test_default_db_warning_present_when_database_omitted() -> None:
+    with patch(
+        "app.tools.PostgreSQLSlowQueriesTool.get_slow_queries",
+        return_value={"source": "postgresql", "available": True, "queries": []},
+    ):
+        result = get_postgresql_slow_queries(host="localhost")
+    assert "default_db_warning" in result
+    assert "postgres" in result["default_db_warning"]
+
+
+def test_no_default_db_warning_when_database_provided() -> None:
+    with patch(
+        "app.tools.PostgreSQLSlowQueriesTool.get_slow_queries",
+        return_value={"source": "postgresql", "available": True, "queries": []},
+    ):
+        result = get_postgresql_slow_queries(host="localhost", database="mydb")
+    assert "default_db_warning" not in result

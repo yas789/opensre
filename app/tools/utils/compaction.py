@@ -7,7 +7,7 @@ within regression limits on noisy fixtures.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, TypeVar
 
 # Default limits for high-volume tools
 DEFAULT_LOG_LIMIT = 50
@@ -17,7 +17,10 @@ DEFAULT_METRICS_LIMIT = 50
 DEFAULT_MESSAGE_CHARS = 1000  # Max characters per log message
 
 
-def truncate_list[T](
+T = TypeVar("T")
+
+
+def truncate_list(  # noqa: UP047
     items: Sequence[T],
     limit: int | None = None,
     default_limit: int = DEFAULT_LOG_LIMIT,
@@ -51,7 +54,9 @@ def truncate_message(message: str, max_chars: int = DEFAULT_MESSAGE_CHARS) -> st
     return message[: max_chars - 3] + "..."
 
 
-def truncate_log_entry(log: dict[str, Any], max_chars: int = DEFAULT_MESSAGE_CHARS) -> dict[str, Any]:
+def truncate_log_entry(
+    log: dict[str, Any], max_chars: int = DEFAULT_MESSAGE_CHARS
+) -> dict[str, Any]:
     """Truncate message fields in a log entry.
 
     Args:
@@ -144,7 +149,11 @@ def compact_metrics(
         compacted = dict(metric)
         # Truncate datapoints if present
         for key in ("datapoints", "values", "points", "data"):
-            if key in compacted and isinstance(compacted[key], list) and len(compacted[key]) > max_datapoints:
+            if (
+                key in compacted
+                and isinstance(compacted[key], list)
+                and len(compacted[key]) > max_datapoints
+            ):
                 compacted[key] = compacted[key][:max_datapoints]
                 compacted[f"{key}_total"] = len(metric.get(key, []))
         result.append(compacted)

@@ -1,11 +1,11 @@
 """Investigation prompt construction with available actions."""
 
-from typing import Any
-
 from pydantic import BaseModel, ValidationError
 
+from app.nodes.investigate.types import ExecutedHypothesis
 
-def _get_executed_sources(executed_hypotheses: list[dict[str, Any]]) -> set[str]:
+
+def _get_executed_sources(executed_hypotheses: list[ExecutedHypothesis]) -> set[str]:
     """Extract executed sources from hypotheses history."""
     executed_sources_set = set()
     for h in executed_hypotheses:
@@ -16,6 +16,17 @@ def _get_executed_sources(executed_hypotheses: list[dict[str, Any]]) -> set[str]
         if single_source:
             executed_sources_set.add(single_source)
     return executed_sources_set
+
+
+def get_blocked_action_names(executed_hypotheses: list[ExecutedHypothesis]) -> set[str]:
+    """Actions that should not be offered again to the planner."""
+    blocked_actions: set[str] = set()
+    for hyp in executed_hypotheses:
+        for field_name in ("actions", "exhausted_actions"):
+            actions_list = hyp.get(field_name, [])
+            if isinstance(actions_list, list):
+                blocked_actions.update(action for action in actions_list if isinstance(action, str))
+    return blocked_actions
 
 
 def _build_available_sources_hint(available_sources: dict[str, dict]) -> str:
@@ -104,7 +115,7 @@ def _build_available_sources_hint(available_sources: dict[str, dict]) -> str:
             f"""{grafana_label} Available:
 - Service Name: {grafana.get("service_name")}
 - Pipeline: {grafana.get("pipeline_name")}
-- Use query_grafana_logs to search Loki for pipeline errors{traces_hint}
+- Use query_grafana_logs to search Loki for pipeline errors, or to fetch AWS Performance Insights and RDS events for database diagnostics{traces_hint}
 - Use query_grafana_alert_rules to inspect alert configuration"""
         )
 
@@ -145,8 +156,21 @@ def _build_available_sources_hint(available_sources: dict[str, dict]) -> str:
 - Commit SHA: {github.get("sha") or "unknown"}
 - Ref: {github.get("ref") or "unknown"}
 - Code Query: {github.get("query") or "exception OR error"}
-- Use list_github_commits to correlate the deployment window with recent code changes
+- Prefer get_git_deploy_timeline for deploy correlation; with no args it auto-uses the shared incident window
+- Use list_github_commits for the N most recent commits regardless of time window
 - Use search_github_code and get_github_file_contents to trace the failure into code"""
+        )
+
+    if "openclaw" in available_sources:
+        openclaw = available_sources["openclaw"]
+        endpoint = openclaw.get("openclaw_command") or openclaw.get("openclaw_url") or "unknown"
+        hints.append(
+            f"""OpenClaw MCP Available:
+- Transport: {openclaw.get("openclaw_mode") or "unknown"}
+- Endpoint: {endpoint}
+- Search hint: {openclaw.get("openclaw_search_query") or "recent conversations"}
+- Start with search_openclaw_conversations to inspect recent OpenClaw context before generic tool calls
+- Use list_openclaw_tools only if you need to inspect the raw bridge surface"""
         )
 
     if "vercel" in available_sources and "github" in available_sources:
@@ -176,6 +200,67 @@ def _build_available_sources_hint(available_sources: dict[str, dict]) -> str:
 - Subsystem: {coralogix.get("subsystem_name") or "unknown"}
 - Default Query: {coralogix.get("default_query")}
 - Use query_coralogix_logs to search Coralogix DataPrime logs for the failing service or error signature"""
+        )
+
+    if "betterstack" in available_sources:
+        betterstack = available_sources["betterstack"]
+        bs_sources = betterstack.get("sources") or []
+        sources_line = (
+            ", ".join(bs_sources)
+            if bs_sources
+            else "none pre-configured (planner must supply 'source' from alert metadata)"
+        )
+        hints.append(
+            f"""Better Stack Telemetry Available:
+- Query endpoint: {betterstack.get("query_endpoint") or "unknown"}
+- Configured sources: {sources_line}
+- Use query_betterstack_logs with a 'source' identifier (base name like t123456_myapp; _logs / _s3 suffixes are appended internally) to UNION recent and historical logs via ClickHouse SQL"""
+        )
+
+    if "bitbucket" in available_sources:
+        bitbucket = available_sources["bitbucket"]
+        hints.append(
+            f"""Bitbucket Available:
+- Workspace: {bitbucket.get("workspace")}
+- Repository: {bitbucket.get("repo_slug")}
+- Ref: {bitbucket.get("ref") or "default"}
+- Use search_bitbucket_code, list_bitbucket_commits, and get_bitbucket_file_contents for targeted repository evidence"""
+        )
+
+    if "snowflake" in available_sources:
+        snowflake = available_sources["snowflake"]
+        hints.append(
+            f"""Snowflake Available:
+- Account: {snowflake.get("account_identifier")}
+- Warehouse: {snowflake.get("warehouse") or "default"}
+- Use query_snowflake_history to inspect bounded query-history evidence around the incident window"""
+        )
+
+    if "azure" in available_sources:
+        azure = available_sources["azure"]
+        hints.append(
+            f"""Azure Monitor Available:
+- Workspace ID: {azure.get("workspace_id")}
+- Query: {azure.get("query") or "default diagnostics query"}
+- Use query_azure_monitor_logs for bounded KQL evidence from Log Analytics"""
+        )
+
+    if "openobserve" in available_sources:
+        openobserve = available_sources["openobserve"]
+        hints.append(
+            f"""OpenObserve Available:
+- Organization: {openobserve.get("org")}
+- Stream: {openobserve.get("stream") or "auto"}
+- Use query_openobserve_logs for bounded log retrieval"""
+        )
+
+    if "opensearch" in available_sources:
+        opensearch = available_sources["opensearch"]
+        hints.append(
+            f"""OpenSearch Analytics Available:
+- Index Pattern: {opensearch.get("index_pattern") or "*"}
+- Query: {opensearch.get("default_query") or "*"}
+- Use query_opensearch_analytics for bounded OpenSearch-compatible evidence"""
         )
 
     if "eks" in available_sources:
@@ -212,7 +297,7 @@ IMPORTANT: Always start with discovery actions before fetching specific resource
 
 def build_investigation_prompt(
     problem_md: str,
-    executed_hypotheses: list[dict[str, Any]],
+    executed_hypotheses: list[ExecutedHypothesis],
     available_actions: list,
     available_sources: dict[str, dict],
     memory_context: str = "",
@@ -229,13 +314,10 @@ def build_investigation_prompt(
     Returns:
         Formatted prompt string for LLM
     """
-    executed_sources_set = _get_executed_sources(executed_hypotheses)
-    executed_actions = [
-        action.name for action in available_actions if action.source in executed_sources_set
-    ]
+    blocked_actions = sorted(get_blocked_action_names(executed_hypotheses))
 
     available_actions_filtered = [
-        action for action in available_actions if action.name not in executed_actions
+        action for action in available_actions if action.name not in blocked_actions
     ]
 
     problem_context = problem_md or "No problem statement available"
@@ -270,7 +352,7 @@ This upstream trace reveals root causes outside the failed service (external API
 Use these proven investigation sequences as guidance for action selection.
 """
 
-    prompt = f"""You are investigating a data pipeline incident.
+    prompt = f"""You are investigating an alert or incident.
 
 Problem Context:
 {problem_context}
@@ -280,10 +362,57 @@ Problem Context:
 Available Investigation Actions:
 {actions_description if actions_description else "No actions available"}
 
-Executed Actions: {", ".join(executed_actions) if executed_actions else "None"}
+Blocked Actions: {", ".join(blocked_actions) if blocked_actions else "None"}
+
+Blocked actions are already explored successful evidence paths or exhausted failures. Do not select them again.
 
 Task: Select the most relevant actions to execute now based on the problem context.
-Consider what information would help diagnose the root cause.
+
+Plan for discrimination, not coverage.
+
+Your goal is to choose the smallest set of actions that will best distinguish between competing root-cause hypotheses and improve final RCA quality.
+Prefer the minimum number of actions needed to make the next diagnosis materially more reliable.
+
+Planning rules:
+1. Form 2-4 plausible root-cause hypotheses from the current evidence.
+2. Prioritize actions that can confirm one hypothesis while ruling out alternatives.
+3. Prefer discriminating evidence over redundant background context.
+4. Avoid actions that are unlikely to change the hypothesis ranking.
+5. Do not repeat the same investigative direction unless it is likely to produce new, decision-changing evidence.
+6. If a source or integration appears unavailable or an action has already failed, treat it as exhausted and do not retry it.
+   Only retry if you can explicitly justify why it would now succeed or produce different evidence.
+7. Prefer actions with high information gain: evidence that can eliminate multiple alternatives at once.
+8. Use the currently available sources and action metadata to choose concrete next steps, while staying compatible with the listed actions only.
+9. For connection and CPU incidents, prioritize evidence that distinguishes between:
+   - idle connections (must be explicitly considered if connection counts are high)
+   - slow or expensive queries
+   - genuine traffic spikes
+   - secondary symptoms caused by another bottleneck
+   Do not stop at identifying resource pressure alone; prefer actions that clarify the mechanism creating that pressure.
+10. For database resource incidents, explicitly consider:
+   - idle or long-lived connections
+   - slow or blocking queries
+   - background processes (e.g. WAL, vacuum, or audit logging systems depending on the database engine)
+   - storage growth sources such as audit logs (for PostgreSQL/Aurora) or other logging mechanisms
+   Prefer actions that reveal these mechanisms when relevant signals (CPU, connections, storage) are elevated.
+
+When selecting actions, optimize for:
+- ruling out competing explanations
+- resolving ambiguous or mixed signals
+- reducing uncertainty efficiently under limited tool budget
+- improving the quality and evidence-grounding of the final RCA
+- identifying the mechanism behind the leading symptom, not just the symptom itself
+
+Additionally:
+- When connection counts are high, explicitly evaluate whether idle connections are contributing to the issue and include this explicitly in your reasoning if relevant.
+- When storage pressure is observed, explicitly consider audit logs or database-specific logging mechanisms (e.g. audit_log for PostgreSQL/Aurora)
+
+Avoid:
+- collecting general context that does not help separate hypotheses
+- repeating already-covered evidence categories without a clear reason
+- chasing red herrings when another action would more directly test the leading alternatives
+
+Return a tight investigation plan with only the most useful next actions.
 """
     return prompt
 
@@ -307,7 +436,7 @@ def apply_tool_budget(actions: list, budget: int) -> list:
 def select_actions(
     actions: list,
     available_sources: dict[str, dict],
-    executed_hypotheses: list[dict[str, Any]],
+    executed_hypotheses: list[ExecutedHypothesis],
     tool_budget: int = 10,
 ) -> tuple[list, list[str]]:
     """
@@ -324,14 +453,10 @@ def select_actions(
     """
     available_actions = [action for action in actions if action.is_available(available_sources)]
 
-    executed_actions_flat = set()
-    for hyp in executed_hypotheses:
-        actions_list = hyp.get("actions", [])
-        if isinstance(actions_list, list):
-            executed_actions_flat.update(actions_list)
+    blocked_action_names = get_blocked_action_names(executed_hypotheses)
 
     available_actions = [
-        action for action in available_actions if action.name not in executed_actions_flat
+        action for action in available_actions if action.name not in blocked_action_names
     ]
 
     # Apply tool budget to cap the selected tool set
@@ -345,7 +470,7 @@ def plan_actions_with_llm(
     llm,
     plan_model: type[BaseModel],
     problem_md: str,
-    executed_hypotheses: list[dict[str, Any]],
+    executed_hypotheses: list[ExecutedHypothesis],
     available_actions: list,
     available_sources: dict[str, dict],
     memory_context: str = "",
